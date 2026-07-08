@@ -7,8 +7,11 @@ Este proyecto es un sistema avanzado de visión artificial diseñado para monito
 El sistema ha sido adaptado específicamente para **entornos reales de oficina**, superando las limitaciones de los sistemas de detección tradicionales:
 
 - **Independencia del Ángulo de Cámara (Vistas Laterales):** Funciona perfectamente incluso si la cámara está ubicada a un costado. El sistema es capaz de detectar la postura viendo un solo hombro y estimando anatómicamente el lado oculto.
+- **Clasificación de Vista Robusta (Frente / Lado / Ángulo):** Combina tres señales independientes de las caderas (asimetría de confianza, separación de hombros y desplazamiento de la nariz) con histéresis temporal. Reconoce el perfil **aunque gires la cara hacia la cámara**, sin exigir que mires a la lente.
+- **Detección de Encorvamiento por Silueta (Vista Lateral):** Cuando estás de costado y las caderas quedan ocultas tras el escritorio, el sistema analiza el **contorno de la espalda con detección de bordes (Canny)** para medir el encorvamiento del tronco, algo que la sola posición de los keypoints no puede capturar.
 - **Detección de Medio Cuerpo (Oclusión Inferior):** No requiere que la persona esté de cuerpo entero en la cámara. Si las caderas o piernas no son visibles, el sistema calcula las proporciones antropométricas usando los hombros y el torso superior.
-- **Independencia de la Dirección de la Mirada:** Utiliza las orejas como referencia principal para la inclinación de la cabeza. La persona puede mirar monitores laterales o el teclado sin que el sistema asuma posturas incorrectas del cuello.
+- **Calibración Personal (Tecla `C`):** Aprende tu postura erguida ideal como línea base. En lugar de comparar contra tablas absolutas (sensibles a tu altura o al FOV), mide cuánto te desvías de tu propia mejor postura, adaptándose a cada persona.
+- **Independencia de la Dirección de la Mirada:** Utiliza las orejas como referencia principal para la inclinación de la cabeza y mide el cuello solo en el plano sagital. La persona puede mirar monitores laterales o el teclado sin que el sistema asuma posturas incorrectas del cuello.
 - **Filtro de Iluminación Inteligente (CLAHE):** Integra ecualización adaptativa de contraste. Funciona excelente en condiciones de baja luz o contraluz sin afectar el rendimiento (FPS).
 - **Rangos RULA Adaptados a Oficina:** Reconoce que la flexión natural del brazo (0-40°) y antebrazo (45-120°) al usar teclado y mouse son posturas aceptables y cómodas, evitando falsas alarmas (rojos) comunes en algoritmos estrictos genéricos.
 - **Alerta Sonora Integrada:** Emite un pitido ("beep") automático si el usuario mantiene un Score RULA alto (riesgo) durante un tiempo prolongado.
@@ -31,6 +34,7 @@ Dado que una sola cámara carece de información de profundidad, el sistema reco
   $f = \frac{ancho\_frame / 2}{\tan(FOV / 2)}$
 - **Proporciones de Drillis & Contini:** Se usan tablas estadísticas poblacionales para conocer la longitud real de los segmentos corporales en función de la altura total del sujeto (ej. *Torso = Altura × 0.288*).
 - **Cálculo de Profundidad (Z-Lifting):** Si la proyección 2D de un segmento corporal (en píxeles) aparece más corta que su longitud teórica proyectada, la diferencia se atribuye matemáticamente al escorzo (el segmento se aleja o acerca a la lente). Usando el teorema de Pitágoras en 3D, el sistema despeja el vector de profundidad ($Z$) para cada articulación hija partiendo del centro del torso.
+- **Detección de Encorvamiento Frontal (Escorzo Calibrado):** De frente, encorvarse es un movimiento en profundidad invisible en X-Y. El sistema lo recupera midiendo el acortamiento (escorzo) del cuello y el torso **relativo a tu postura más erguida** (ratio segmento/ancho de hombros, invariante a la distancia a la cámara), anclado en el plano de los hombros (cuyo ancho no se acorta al inclinarse).
 - **Suavizado Temporal:** Se aplica una **Media Móvil Exponencial (EMA)** a los vectores 3D resultantes para eliminar el *jitter* (temblor) de los keypoints en tiempo real.
 
 ### 3. Fase de Evaluación Biomecánica RULA (`evaluador_rula.py`)
@@ -40,16 +44,24 @@ El Método RULA divide el cuerpo en el Grupo A (brazos, muñecas) y Grupo B (cue
 - **Marcos de Referencia Relativos:** A diferencia de sistemas ingenuos que miden los brazos contra la "gravedad absoluta", este sistema proyecta un eje local a lo largo del tronco. La flexión del brazo superior se mide *relativa al ángulo de inclinación del torso*, lo cual es el estándar biomecánico correcto.
 - **Filtro de Confianza (Confidence Scoring):** En vistas donde la cámara solo capta un lado del cuerpo de manera fiable, el sistema evalúa ambos lados pero confía y reporta el score del hemisferio corporal cuya sumatoria de confianza de keypoints ($\sum P_c$) sea mayor, evitando falsas alarmas generadas por oclusiones visuales.
 
+### 4. Módulo Auxiliar: Detección de Encorvamiento Lateral (`detector_encorvamiento.py`)
+De costado y sentado, la cadera queda oculta tras el escritorio y el detector la fabrica justo debajo del hombro, por lo que el tronco parece **siempre vertical** aunque la persona se encorve. La única señal que queda es el contorno de la espalda:
+- **Detección de Bordes (Canny):** Sobre un ROI del torso acotado por los keypoints (hombro/oreja), se aplica desenfoque gaussiano y el operador **Canny** para extraer los bordes.
+- **Trazado Robusto del Contorno:** Fila por fila se toma el borde más cercano a la posición esperada de la espalda, descartando bordes internos de la ropa y el respaldo de la silla. Se ajusta una recta (`polyfit`) con rechazo de *outliers*; si el contorno es demasiado ruidoso, la señal se descarta y el sistema no genera falsas alarmas.
+- **Ángulo Calibrado:** La inclinación del contorno se mide respecto a la vertical, se calibra contra tu postura más erguida y se escala a flexión de tronco efectiva para alimentar el score RULA cuando la cadera es fabricada.
+
 ---
 
 ## 🛠️ Estructura de Archivos
 
 - `Postura.py`: Archivo principal de ejecución. Maneja el ciclo de la cámara, hilos de alarma y orquesta los demás módulos.
-- `config.py`: Configuraciones globales. Aquí puedes ajustar los límites RULA, variables de la alarma, uso de GPU/CPU, umbrales de detección y activación del filtro CLAHE.
+- `config.py`: Configuraciones globales. Aquí puedes ajustar los límites RULA, variables de la alarma, uso de GPU/CPU, umbrales de detección, calibración y activación del filtro CLAHE.
 - `detector_2d.py`: Clase `Detector2D` (YOLO y preprocesamiento).
-- `elevador_3d.py`: Clase `Elevador3D` (Geometría).
-- `evaluador_rula.py`: Clase `EvaluadorRULA` (Lógica ergonómica).
+- `elevador_3d.py`: Clase `Elevador3D` (Geometría, escorzo calibrado y suavizado).
+- `evaluador_rula.py`: Clase `EvaluadorRULA` (Detección de vista y lógica ergonómica).
+- `detector_encorvamiento.py`: Clase `AnalizadorSiluetaLateral` (Encorvamiento lateral por bordes Canny).
 - `visualizador.py`: Encargado de renderizar el HUD (Panel de control semitransparente), el esqueleto de colores, barras de riesgo y los ángulos sobre la imagen de la cámara.
+- `informe.md`: Informe técnico exhaustivo con todas las técnicas, librerías y la conexión detallada del código.
 
 ---
 
@@ -75,6 +87,7 @@ python Postura.py
 
 ### Controles durante la ejecución:
 - **`Q`**: Salir del programa y cerrar la cámara.
+- **`C`**: Recalibrar tu línea base de postura. Siéntate erguido y púlsala: el sistema aprende esa postura como referencia y mide cuánto te desvías de ella (afecta tanto al encorvamiento frontal como al lateral).
 
 ### Interpretación del HUD (Panel en pantalla):
 El sistema dibuja un esqueleto sobre la persona y un panel de información. El color indica el nivel de acción RULA:
@@ -93,3 +106,5 @@ Puedes abrir el archivo `config.py` para adaptar el programa a tus necesidades. 
 - `UMBRAL_FRAMES_ALARMA`: Número de frames (tiempo) que debe mantenerse una mala postura antes de que suene la alarma.
 - `PREPROCESAMIENTO_ACTIVO`: Cambia a `False` si tienes iluminación de estudio perfecta y deseas ganar 1-2 FPS.
 - `ALTURA_SUJETO_CM`: Altura en cm usada para mejorar la precisión del modelo 3D.
+- `YOLO_MODELO` / `YOLO_IMGSZ`: Cambia a `'yolov8s-pose.pt'` o sube `YOLO_IMGSZ` a `960` para más precisión (a costa de FPS en CPU).
+- `ENCORVADO_ACTIVO`: Activa/desactiva la detección de encorvamiento lateral por silueta. Los parámetros `ENCORVADO_*` ajustan su sensibilidad: sube `ENCORVADO_RESIDUO_MAX` para ser más permisivo con fondos complejos, o baja `ENCORVADO_GANANCIA` si detecta encorvamiento de más.

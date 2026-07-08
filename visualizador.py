@@ -219,6 +219,34 @@ class Visualizador:
                       (barra_x + fill_w, barra_y + barra_alto),
                       color_borde, -1)
 
+    # Etiquetas y fiabilidad mostradas en pantalla por tipo de vista.
+    # 'angulo' es la única vista marcada como no fiable: el ratio cae en una
+    # zona intermedia ambigua entre frontal y lateral. Esta clasificación viene
+    # de evaluador_rula._detectar_vista, fuente única de verdad (ver
+    # resultado['vista'] en evaluar()), para no duplicar la lógica aquí.
+    ETIQUETAS_VISTA = {'frontal': 'FRENTE', 'lateral': 'LADO', 'angulo': 'ANGULO'}
+    VISTAS_FIABLES = {'frontal', 'lateral'}
+
+    def _dibujar_vista(self, frame, resultado):
+        """Muestra el ángulo de cámara detectado y la fiabilidad sagital."""
+        if resultado is None or 'vista' not in resultado:
+            return
+
+        etiqueta = self.ETIQUETAS_VISTA.get(resultado['vista'])
+        if etiqueta is None:
+            return
+        fiable = resultado['vista'] in self.VISTAS_FIABLES
+
+        w = frame.shape[1]
+        color = COLOR_VERDE if fiable else COLOR_AMARILLO
+        texto = f"Vista: {etiqueta}"
+        cv2.putText(frame, texto, (w - 175, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+        if not fiable:
+            cv2.putText(frame, "postura sagital incierta", (w - 235, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_AMARILLO, 1, cv2.LINE_AA)
+
     def _dibujar_fps(self, frame):
         """Muestra el indicador de FPS en la esquina inferior izquierda."""
         h, w = frame.shape[:2]
@@ -230,7 +258,7 @@ class Visualizador:
     def _dibujar_instrucciones(self, frame):
         """Muestra instrucciones de teclas en la esquina inferior derecha."""
         h, w = frame.shape[:2]
-        cv2.putText(frame, "Presiona Q para salir", (w - 220, h - 15),
+        cv2.putText(frame, "C: calibrar erguido  |  Q: salir", (w - 280, h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_GRIS, 1, cv2.LINE_AA)
 
     @staticmethod
@@ -264,6 +292,9 @@ class Visualizador:
 
         # Capa 3: Panel HUD
         self._dibujar_hud(frame, resultado)
+
+        # Capa 3.5: Indicador de vista de cámara
+        self._dibujar_vista(frame, resultado)
 
         # Capa 4: FPS
         self._dibujar_fps(frame)

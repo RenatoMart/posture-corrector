@@ -14,6 +14,13 @@ Pipeline:
 """
 
 import numpy as np
+from config import (
+    CONF_FABRICADO,
+    VISTA_ASIMETRIA_LATERAL, VISTA_SPREAD_FRONTAL, VISTA_SPREAD_LATERAL,
+    VISTA_NARIZ_OFFSET_LATERAL, VISTA_HISTERESIS_FRAMES,
+    ENCORVADO_ACTIVO,
+)
+from detector_encorvamiento import AnalizadorSiluetaLateral
 
 
 class EvaluadorRULA:
@@ -101,7 +108,19 @@ class EvaluadorRULA:
     }
 
     def __init__(self):
-        pass
+        # Estado para la histéresis de la clasificación de vista (anti-parpadeo)
+        self._vista_actual = None        # vista estable mostrada/usada
+        self._lado_actual = None
+        self._vista_pendiente = None     # vista candidata a reemplazar la actual
+        self._vista_pendiente_n = 0      # frames consecutivos viendo la candidata
+
+        # Analizador de encorvamiento por silueta (vista lateral con cadera oculta)
+        self._analizador_silueta = AnalizadorSiluetaLateral() if ENCORVADO_ACTIVO else None
+
+    def recalibrar(self):
+        """Reinicia la línea base del detector de encorvamiento lateral (tecla 'C')."""
+        if self._analizador_silueta is not None:
+            self._analizador_silueta.recalibrar()
 
     # =========================================================================
     # UTILIDADES DE CONFIANZA (para vistas laterales)
@@ -159,6 +178,180 @@ class EvaluadorRULA:
             return score_der  # Solo confiar en el derecho
         else:
             return min(score_izq, score_der)  # Ninguno domina: ser generoso
+
+    # =========================================================================
+    # DETECCIÓN DE VISTA DE CÁMARA (frontal / ángulo / lateral)
+    # =========================================================================
+
+    @staticmethod
+    def _indices_lado(lado):
+        """Mapea 'izq'/'der' a los índices COCO de ese lado del cuerpo."""
+        if lado == 'izq':
+            return {'hombro': 5, 'codo': 7, 'muneca': 9, 'cadera': 11, 'oreja': 3}
+        return {'hombro': 6, 'codo': 8, 'muneca': 10, 'cadera': 12, 'oreja': 4}
+
+    @staticmethod
+    def _clasificar_vista_cruda(keypoints_2d):
+        """
+        Clasificación instantánea (sin histéresis) del ángulo de cámara.
+
+        Combina tres señales robustas que NO dependen de las caderas (que suelen
+        estar fabricadas al estar sentado, lo que antes rompía la detección):
+
+          1) Asimetría de confianza entre lados. En perfil, todo un lado del
+             cuerpo (ojo, oreja, hombro, cadera) queda ocluido y recibe baja
+             confianza o se fabrica. Si el lado débil tiene mucha menos
+             confianza que el fuerte → lateral.
+          2) Separación de hombros normalizada por el alto de la cabeza
+             (hombros→nariz/oreja). De frente los hombros se ven anchos respecto
+             a la cabeza; de costado se juntan. Es escala-invariante e
+             independiente de las caderas.
+          3) Desplazamiento horizontal de la nariz respecto al centro de los
+             hombros. De frente la nariz queda centrada entre los hombros
+             (incluso girando la cabeza); de costado queda claramente hacia el
+             hombro visible. Esta señal reconoce la vista lateral aunque la
+             persona gire la cabeza hacia la cámara (antes eso confundía a las
+             señales 1 y 2 y el sistema "exigía" mirar a la cámara de costado).
+
+        Returns:
+            (vista, lado_fiable)
+        """
+        if keypoints_2d is None:
+            return 'frontal', None
+
+        tiene_izq = 5 in keypoints_2d
+        tiene_der = 6 in keypoints_2d
+        if not tiene_izq and not tiene_der:
+            return 'frontal', None
+        # Un solo hombro presente: vista lateral inequívoca (defensivo; el
+        # detector normalmente fabrica el faltante, pero por si acaso).
+        if tiene_izq != tiene_der:
+            return 'lateral', ('izq' if tiene_izq else 'der')
+
+        # --- Señal 1: confianza real (no fabricada) por lado del cuerpo ---
+        def _conf_lado(indices):
+            return sum(
+                keypoints_2d[i][2]
+                for i in indices
+                if i in keypoints_2d and keypoints_2d[i][2] > CONF_FABRICADO
+            )
+
+        conf_izq = _conf_lado([1, 3, 5, 11])   # ojo, oreja, hombro, cadera izq
+        conf_der = _conf_lado([2, 4, 6, 12])   # ojo, oreja, hombro, cadera der
+
+        lado_fuerte = 'izq' if conf_izq >= conf_der else 'der'
+        mayor = max(conf_izq, conf_der)
+        menor = min(conf_izq, conf_der)
+        asimetria = (menor / mayor) if mayor > 1e-6 else 1.0
+
+        # --- Señal 2: separación de hombros / alto de la cabeza ---
+        hombro_izq = keypoints_2d[5]
+        hombro_der = keypoints_2d[6]
+        ancho_hombros = abs(hombro_izq[0] - hombro_der[0])
+        centro_hombros_y = (hombro_izq[1] + hombro_der[1]) / 2
+
+        cabeza_y = None
+        for idx in (0, 3, 4, 1, 2):  # nariz, orejas, ojos (lo primero disponible y real)
+            if idx in keypoints_2d and keypoints_2d[idx][2] > CONF_FABRICADO:
+                cabeza_y = keypoints_2d[idx][1]
+                break
+
+        norm_spread = None
+        alto_cabeza = None
+        if cabeza_y is not None:
+            alto_cabeza = abs(centro_hombros_y - cabeza_y)
+            if alto_cabeza > 1e-3:
+                norm_spread = ancho_hombros / alto_cabeza
+
+        # --- Señal 3: nariz descentrada respecto al centro de los hombros ---
+        nariz_offset = None
+        if (0 in keypoints_2d and keypoints_2d[0][2] > CONF_FABRICADO
+                and alto_cabeza is not None and alto_cabeza > 1e-3):
+            centro_hombros_x = (hombro_izq[0] + hombro_der[0]) / 2
+            nariz_offset = abs(keypoints_2d[0][0] - centro_hombros_x) / alto_cabeza
+
+        # --- Decisión combinada ---
+        muy_asimetrico = asimetria < VISTA_ASIMETRIA_LATERAL
+        hombros_juntos = norm_spread is not None and norm_spread < VISTA_SPREAD_LATERAL
+        hombros_separados = norm_spread is not None and norm_spread > VISTA_SPREAD_FRONTAL
+        nariz_descentrada = (nariz_offset is not None
+                             and nariz_offset > VISTA_NARIZ_OFFSET_LATERAL)
+
+        # Lateral si un lado está ocluido, los hombros se ven casi superpuestos
+        # o la nariz cae claramente fuera del centro de los hombros (cuerpo de
+        # perfil aunque la cara mire a la cámara)
+        if muy_asimetrico or hombros_juntos or nariz_descentrada:
+            # Si la decisión vino por geometría (no por oclusión), el lado
+            # fiable es hacia donde apunta la nariz: el hombro más cercano a
+            # ella es el visible/delantero.
+            if not muy_asimetrico and nariz_offset is not None:
+                d_izq = abs(keypoints_2d[0][0] - hombro_izq[0])
+                d_der = abs(keypoints_2d[0][0] - hombro_der[0])
+                lado_geom = 'izq' if d_izq <= d_der else 'der'
+                return 'lateral', lado_geom
+            return 'lateral', lado_fuerte
+
+        # Frontal solo si los hombros se ven claramente anchos y no hay oclusión
+        if hombros_separados:
+            return 'frontal', None
+
+        # Sin referencia geométrica de cabeza: decidir solo por asimetría
+        if norm_spread is None:
+            return ('frontal', None) if asimetria > 0.7 else ('angulo', lado_fuerte)
+
+        # Zona intermedia
+        return 'angulo', lado_fuerte
+
+    def _detectar_vista(self, keypoints_2d):
+        """
+        Clasifica el ángulo de cámara con histéresis temporal (anti-parpadeo).
+
+        En vista lateral/ángulo, el hombro/cadera del lado oculto son fabricados
+        (ver detector_2d); medir el tronco/cuello con ellos (vía los puntos
+        medios 17/18) introduce un desplazamiento horizontal falso aunque la
+        persona esté erguida. Por eso, fuera de la vista frontal, se mide con los
+        puntos REALES de un solo lado (el fiable), nunca con los fabricados.
+
+        La histéresis evita que la etiqueta y la ruta de medición salten de un
+        frame a otro en posiciones límite: una vista nueva debe sostenerse varios
+        frames antes de reemplazar a la actual.
+
+        Returns:
+            (vista, lado_fiable)
+            vista: 'frontal' | 'lateral' | 'angulo'
+            lado_fiable: 'izq' | 'der' | None (None solo en vista frontal)
+        """
+        vista_cruda, lado_crudo = self._clasificar_vista_cruda(keypoints_2d)
+
+        # Primer frame: adoptar de inmediato (sin esperar histéresis)
+        if self._vista_actual is None:
+            self._vista_actual = vista_cruda
+            self._lado_actual = lado_crudo
+            self._vista_pendiente = None
+            self._vista_pendiente_n = 0
+            return self._vista_actual, self._lado_actual
+
+        # Si coincide con la vista estable: actualizar el lado y limpiar pendiente
+        if vista_cruda == self._vista_actual:
+            self._lado_actual = lado_crudo
+            self._vista_pendiente = None
+            self._vista_pendiente_n = 0
+            return self._vista_actual, self._lado_actual
+
+        # Vista distinta: acumular evidencia antes de cambiar
+        if vista_cruda == self._vista_pendiente:
+            self._vista_pendiente_n += 1
+        else:
+            self._vista_pendiente = vista_cruda
+            self._vista_pendiente_n = 1
+
+        if self._vista_pendiente_n >= VISTA_HISTERESIS_FRAMES:
+            self._vista_actual = vista_cruda
+            self._lado_actual = lado_crudo
+            self._vista_pendiente = None
+            self._vista_pendiente_n = 0
+
+        return self._vista_actual, self._lado_actual
 
     # =========================================================================
     # CÁLCULO DE ÁNGULOS 3D
@@ -278,17 +471,36 @@ class EvaluadorRULA:
         comp_lateral = abs(np.dot(vec_brazo, n_sagital))
         return (comp_lateral / norma_brazo) > 0.35
 
-    def _calcular_angulos(self, kp3d):
+    def _calcular_angulos(self, kp3d, vista='frontal', lado_fiable=None,
+                          tronco_silueta=None, keypoints_2d=None):
         """
         Calcula todos los ángulos necesarios para RULA a partir de keypoints 3D.
-        
+
+        Despacha a una de dos rutas de medición:
+        - Frontal (vista='frontal'): usa los puntos medios virtuales 17/18
+          (cuello, centro de cadera), que combinan información de ambos lados.
+        - Lateral/ángulo (lado_fiable definido): usa SOLO los puntos reales del
+          lado visible, evitando los keypoints fabricados del lado oculto que
+          contaminarían el tronco/cuello con un desplazamiento horizontal falso.
+
         Args:
             kp3d: dict {idx: np.array([X, Y, Z])}
                   Índices 17 = cuello virtual, 18 = centro cadera virtual
-        
+            vista: 'frontal' | 'lateral' | 'angulo'
+            lado_fiable: 'izq' | 'der' | None
+            tronco_silueta: flexión de tronco (grados) estimada por silueta en
+                vista lateral cuando la cadera es fabricada, o None.
+            keypoints_2d: dict 2D para saber si la cadera del lado visible es real.
+
         Returns:
             dict con ángulos en grados para cada segmento.
         """
+        if vista in ('lateral', 'angulo') and lado_fiable is not None:
+            return self._angulos_lateral(kp3d, lado_fiable, tronco_silueta, keypoints_2d)
+        return self._angulos_frontal(kp3d)
+
+    def _angulos_frontal(self, kp3d):
+        """Calcula los ángulos usando ambos lados (puntos medios 17/18)."""
         angulos = {}
 
         # Vector vertical (gravedad apunta hacia abajo = Y positivo)
@@ -296,35 +508,49 @@ class EvaluadorRULA:
         vertical_arriba = np.array([0, -1, 0])
 
         # --- CUELLO ---
-        # Ángulo de inclinación de la cabeza respecto a la vertical.
-        # Usa orejas como referencia primaria (independiente de dirección de mirada).
-        # La nariz solo se usa como fallback si no hay orejas disponibles.
+        # Ángulo de inclinación de la cabeza respecto a la vertical, medido
+        # SOLO en el plano sagital (componentes Y y Z). En vista frontal, la
+        # flexión real del cuello es un movimiento en profundidad: la
+        # componente X solo aporta artefactos cuando la persona gira la cabeza
+        # o cuando la referencia es asimétrica (una sola oreja / nariz).
+        # Antes ese artefacto penalizaba a quien no miraba a la cámara.
         if 17 in kp3d:
             cuello = kp3d[17]
-            
-            # Determinar punto de referencia de la cabeza (prioridad: orejas > nariz)
+
+            # Referencia de la cabeza (prioridad: orejas > ojos > una oreja > nariz).
+            # Usar más puntos de la cara hace la referencia estable ante giros.
             cabeza = None
             if 3 in kp3d and 4 in kp3d:
-                # Mejor caso: punto medio entre orejas
-                cabeza = (kp3d[3] + kp3d[4]) / 2
+                cabeza = (kp3d[3] + kp3d[4]) / 2      # Punto medio entre orejas
+            elif 1 in kp3d and 2 in kp3d:
+                cabeza = (kp3d[1] + kp3d[2]) / 2      # Punto medio entre ojos
             elif 3 in kp3d:
-                cabeza = kp3d[3]  # Solo oreja izquierda
+                cabeza = kp3d[3]
             elif 4 in kp3d:
-                cabeza = kp3d[4]  # Solo oreja derecha
+                cabeza = kp3d[4]
             elif 0 in kp3d:
-                cabeza = kp3d[0]  # Fallback: nariz
-            
+                cabeza = kp3d[0]
+
             if cabeza is not None:
                 vec_cuello = cabeza - cuello
-                angulo_cuello = self._angulo_entre_vectores(vec_cuello, vertical_arriba)
+                # Proyección sagital: descartar X (giros/inclinación lateral de
+                # cabeza no son flexión). La profundidad Z proviene del escorzo
+                # calibrado (ver elevador_3d._elevar_sagital): cabeza adelantada
+                # => Z menor que los hombros => ángulo crece.
+                vec_sagital = np.array([0.0, vec_cuello[1], vec_cuello[2]])
+                angulo_cuello = self._angulo_entre_vectores(vec_sagital, vertical_arriba)
                 angulos['cuello_flexion'] = angulo_cuello
-                
-                # Extensión del cuello: cabeza por detrás/encima de la línea del cuello
-                # Usamos Y (vertical) en lugar de Z, ya que Y es independiente del
-                # ángulo de cámara. Si la cabeza está más arriba de lo normal = extensión
-                vec_tronco_ref = kp3d[18] - cuello if 18 in kp3d else vertical
-                # Proyección del vector cuello en la dirección opuesta al tronco
-                angulos['cuello_extension'] = vec_cuello[1] < cuello[1] * 0.1 and angulo_cuello > 15
+
+                # Extensión (mirar hacia arriba): la nariz sube por encima de la
+                # línea de los ojos. En reposo la nariz queda claramente por
+                # debajo de los ojos; solo una extensión franca invierte eso.
+                # (Y crece hacia abajo, por eso el signo.)
+                en_extension = False
+                if 0 in kp3d and 1 in kp3d and 2 in kp3d:
+                    ojos_y = (kp3d[1][1] + kp3d[2][1]) / 2
+                    escala_cabeza = max(np.linalg.norm(vec_cuello), 1e-6)
+                    en_extension = (ojos_y - kp3d[0][1]) > 0.10 * escala_cabeza
+                angulos['cuello_extension'] = en_extension
             else:
                 angulos['cuello_flexion'] = 0
                 angulos['cuello_extension'] = False
@@ -400,6 +626,129 @@ class EvaluadorRULA:
 
         return angulos
 
+    def _angulos_lateral(self, kp3d, lado, tronco_silueta=None, keypoints_2d=None):
+        """
+        Calcula los ángulos usando SOLO los puntos reales del lado visible.
+
+        De costado, la imagen ya ES el plano sagital: no hace falta proyectar
+        nada ni estimar profundidad. Se evita por completo el punto medio
+        17/18 (que mezclaría el lado real con el hombro/cadera fabricados del
+        lado oculto) y se mide directamente hombro→cadera y hombro→oreja del
+        lado visible.
+
+        Nota: el elevador 3D asigna la MISMA profundidad Z a todos los puntos
+        del torso y la cabeza (ver elevador_3d.py Paso 1), así que el vector
+        hombro→cadera de un mismo lado ya tiene componente Z = 0 — no hace
+        falta descartarlo explícitamente, el resultado es equivalente a
+        medir en el plano de la imagen (X-Y).
+
+        Args:
+            kp3d: dict {idx: np.array([X, Y, Z])}
+            lado: 'izq' o 'der' — el lado fiable detectado por _detectar_vista
+            tronco_silueta: flexión de tronco por silueta (grados) o None.
+            keypoints_2d: dict 2D, para saber si la cadera del lado es real.
+
+        Returns:
+            dict con ángulos en grados (mismo formato que _angulos_frontal).
+        """
+        angulos = {}
+        vertical_arriba = np.array([0, -1, 0])
+
+        idx = self._indices_lado(lado)
+        h, cd, m, c, o = idx['hombro'], idx['codo'], idx['muneca'], idx['cadera'], idx['oreja']
+
+        # --- TRONCO --- hombro → cadera del lado visible, vs vertical.
+        # Si la cadera es fabricada (típico sentado: pelvis oculta tras el
+        # escritorio), este vector sale casi vertical y NO refleja el
+        # encorvamiento. En ese caso se usa la estimación por silueta de la
+        # espalda (bordes Canny), que sí captura la inclinación del tronco.
+        cadera_fabricada = (
+            keypoints_2d is None
+            or c not in keypoints_2d
+            or keypoints_2d[c][2] <= CONF_FABRICADO
+        )
+        if h in kp3d and c in kp3d:
+            vec_tronco = kp3d[h] - kp3d[c]
+            tronco_kp = self._angulo_entre_vectores(vec_tronco, vertical_arriba)
+        else:
+            tronco_kp = 0
+
+        if cadera_fabricada and tronco_silueta is not None:
+            # Cadera oculta: la silueta es la única fuente fiable del tronco.
+            angulos['tronco_flexion'] = tronco_silueta
+        elif tronco_silueta is not None:
+            # Cadera real: usar keypoints, pero no reportar menos que la silueta
+            # (conservador, coherente con el "peor caso" del resto del RULA).
+            angulos['tronco_flexion'] = max(tronco_kp, tronco_silueta)
+        else:
+            angulos['tronco_flexion'] = tronco_kp
+
+        # --- CUELLO --- oreja → hombro del lado visible, vs vertical.
+        # Las orejas nunca son fabricadas por el detector, así que si la del
+        # lado fiable falta (p.ej. cabeza girada hacia la cámara) se usa la
+        # otra oreja real. La medición NO depende de hacia dónde mire la cara.
+        oreja_ref = None
+        for idx_oreja in (o, 7 - o):  # oreja del lado fiable, luego la otra (3+4=7)
+            if idx_oreja in kp3d:
+                oreja_ref = kp3d[idx_oreja]
+                break
+
+        if oreja_ref is not None and h in kp3d:
+            vec_cuello = oreja_ref - kp3d[h]
+            angulo_cuello = self._angulo_entre_vectores(vec_cuello, vertical_arriba)
+            angulos['cuello_flexion'] = angulo_cuello
+
+            # En perfil la nariz queda DELANTE de la oreja: eso indica hacia
+            # dónde mira la persona. Si la oreja queda por DETRÁS del hombro
+            # (en contra de la mirada) la cabeza va hacia atrás => extensión.
+            en_extension = False
+            if 0 in kp3d:
+                direccion_frente = np.sign(kp3d[0][0] - oreja_ref[0])
+                lean = (oreja_ref[0] - kp3d[h][0]) * direccion_frente
+                en_extension = lean < 0 and angulo_cuello > 8
+            angulos['cuello_extension'] = en_extension
+        else:
+            angulos['cuello_flexion'] = 0
+            angulos['cuello_extension'] = False
+
+        # --- BRAZO SUPERIOR --- flexión relativa al eje del tronco (no al eje
+        # hombro-hombro, que en lateral incluye un hombro fabricado)
+        if h in kp3d and cd in kp3d and c in kp3d:
+            vec_brazo = kp3d[cd] - kp3d[h]
+            vec_tronco_abajo = kp3d[c] - kp3d[h]  # dirección "brazo colgando" = 0°
+            angulo_brazo = self._angulo_entre_vectores(vec_brazo, vec_tronco_abajo)
+        else:
+            angulo_brazo = 0
+
+        # Abducción y elevación de hombro requieren el hombro opuesto real:
+        # en lateral ese punto es fabricado, así que no se evalúan (evita
+        # falsos +1 en el score de brazo; ver PLAN_LATERAL.md causa B).
+        angulos[f'brazo_sup_{lado}'] = angulo_brazo
+        angulos[f'hombro_elevado_{lado}'] = False
+        angulos[f'brazo_abducido_{lado}'] = False
+
+        # --- ANTEBRAZO --- ángulo en el codo del lado visible (ya usaba solo
+        # puntos reales, no cambia respecto a la versión frontal)
+        if h in kp3d and cd in kp3d and m in kp3d:
+            angulo_codo = self._angulo_en_articulacion(kp3d[h], kp3d[cd], kp3d[m])
+            angulos[f'antebrazo_{lado}'] = 180 - angulo_codo
+        else:
+            angulos[f'antebrazo_{lado}'] = 90
+
+        # Lado no fiable: se deja en neutral por si algo lo lee (HUD, etc.);
+        # evaluar() nunca usa estas claves en vista lateral/ángulo.
+        otro = 'der' if lado == 'izq' else 'izq'
+        angulos[f'brazo_sup_{otro}'] = 0
+        angulos[f'hombro_elevado_{otro}'] = False
+        angulos[f'brazo_abducido_{otro}'] = False
+        angulos[f'antebrazo_{otro}'] = 90
+
+        angulos['muneca_izq'] = 0
+        angulos['muneca_der'] = 0
+        angulos['giro_muneca'] = 1
+
+        return angulos
+
     # =========================================================================
     # MAPEO DE ÁNGULOS A SCORES RULA
     # =========================================================================
@@ -452,38 +801,53 @@ class EvaluadorRULA:
 
     @staticmethod
     def _score_cuello(angulo_flexion, en_extension=False):
-        """Mapea ángulo del cuello a score RULA (1-6)."""
+        """Mapea ángulo del cuello a score RULA (1-6).
+
+        El límite del score 1 (12°) deja una pequeña tolerancia para el ruido
+        de la estimación de profundidad (cabeza adelantada) en vista frontal.
+        """
         if en_extension:
             return 4  # Cuello en extensión
-        elif angulo_flexion <= 10:
-            return 1  # 0° - 10°
-        elif angulo_flexion <= 20:
-            return 2  # 10° - 20°
+        elif angulo_flexion <= 12:
+            return 1  # 0° - 12° (neutral)
+        elif angulo_flexion <= 22:
+            return 2  # 12° - 22°
         else:
-            return 3  # > 20° flexión
+            return 3  # > 22° flexión (cabeza caída o muy adelantada)
 
     @staticmethod
     def _score_tronco(angulo_flexion):
-        """Mapea ángulo del tronco a score RULA (1-6)."""
-        if angulo_flexion <= 5:
-            return 1   # Neutral (sentado derecho)
+        """Mapea ángulo del tronco a score RULA (1-6).
+
+        Umbrales ajustados para postura sentada de oficina, donde el ángulo del
+        tronco ahora incorpora la inclinación sagital estimada por escorzo. El
+        límite del score 1 (10°) absorbe el ruido propio de esa estimación.
+        """
+        if angulo_flexion <= 10:
+            return 1   # Sentado erguido (con tolerancia a ruido)
         elif angulo_flexion <= 20:
-            return 2   # 0° - 20° flexión
-        elif angulo_flexion <= 60:
-            return 3   # 20° - 60° flexión
+            return 2   # Ligera inclinación
+        elif angulo_flexion <= 45:
+            return 3   # Encorvado moderado
         else:
-            return 4   # > 60° flexión
+            return 4   # Encorvado severo
 
     # =========================================================================
     # EVALUACIÓN COMPLETA
     # =========================================================================
 
-    def evaluar(self, keypoints_3d):
+    def evaluar(self, keypoints_3d, keypoints_2d=None, frame=None):
         """
         Evalúa la postura completa según el método RULA.
 
         Args:
             keypoints_3d: dict {idx: np.array([X, Y, Z])} de la Fase 2.
+            keypoints_2d: dict {idx: (x, y, conf)} de la Fase 1. Se usa para
+                detectar el ángulo de cámara (frontal/lateral/ángulo) y elegir
+                la ruta de medición correcta. Si se omite, se asume frontal.
+            frame: imagen BGR original (sin dibujos). Opcional. Si se provee y
+                la vista es lateral, se usa para estimar el encorvamiento del
+                tronco por silueta (cuando la cadera está oculta/fabricada).
 
         Returns:
             dict con:
@@ -495,44 +859,69 @@ class EvaluadorRULA:
                 'nivel': nivel de acción RULA
                 'texto': descripción del nivel
                 'color_key': clave de color para visualización
+                'vista': 'frontal' | 'lateral' | 'angulo'
+                'lado_fiable': 'izq' | 'der' | None
         """
         if keypoints_3d is None:
             return None
 
-        # Calcular ángulos 3D
-        angulos = self._calcular_angulos(keypoints_3d)
+        # Detectar ángulo de cámara
+        vista, lado_fiable = self._detectar_vista(keypoints_2d)
+
+        # En vista lateral, estimar el encorvamiento del tronco por silueta
+        # (bordes) cuando la cadera no da información fiable.
+        tronco_silueta = None
+        if (self._analizador_silueta is not None and frame is not None
+                and vista in ('lateral', 'angulo') and lado_fiable is not None):
+            tronco_silueta = self._analizador_silueta.analizar(
+                frame, keypoints_2d, lado_fiable
+            )
+
+        # Calcular ángulos 3D por la ruta correcta
+        angulos = self._calcular_angulos(
+            keypoints_3d, vista, lado_fiable, tronco_silueta, keypoints_2d
+        )
 
         # =====================================================================
         # GRUPO A: Brazo, Antebrazo, Muñeca
         # =====================================================================
-        # Evaluar ambos lados. En vistas laterales, un lado puede tener
-        # keypoints estimados (baja confianza) — priorizar el lado confiable.
-        score_brazo_izq = self._score_brazo_superior(
-            angulos['brazo_sup_izq'],
-            angulos.get('hombro_elevado_izq', False),
-            angulos.get('brazo_abducido_izq', False)
-        )
-        score_brazo_der = self._score_brazo_superior(
-            angulos['brazo_sup_der'],
-            angulos.get('hombro_elevado_der', False),
-            angulos.get('brazo_abducido_der', False)
-        )
-        
-        # Determinar confianza de cada lado
-        conf_izq = self._confianza_lado(keypoints_3d, 'izq')
-        conf_der = self._confianza_lado(keypoints_3d, 'der')
-        
-        # Seleccionar score del brazo: preferir el lado con mayor confianza
-        # Si ambos son confiables, usar el peor (más conservador)
-        score_brazo = self._seleccionar_por_confianza(
-            score_brazo_izq, conf_izq, score_brazo_der, conf_der
-        )
+        if vista in ('lateral', 'angulo') and lado_fiable is not None:
+            # Vista lateral/ángulo: usar directamente el lado fiable medido
+            # con puntos reales (ver _angulos_lateral). No mezclar con el
+            # lado oculto, cuyos keypoints son fabricados.
+            sufijo = lado_fiable
+            score_brazo = self._score_brazo_superior(
+                angulos[f'brazo_sup_{sufijo}'],
+                angulos.get(f'hombro_elevado_{sufijo}', False),
+                angulos.get(f'brazo_abducido_{sufijo}', False)
+            )
+            score_antebrazo = self._score_antebrazo(angulos[f'antebrazo_{sufijo}'])
+        else:
+            # Vista frontal: evaluar ambos lados y elegir según confianza
+            # (ambos confiables → el peor caso, más conservador)
+            score_brazo_izq = self._score_brazo_superior(
+                angulos['brazo_sup_izq'],
+                angulos.get('hombro_elevado_izq', False),
+                angulos.get('brazo_abducido_izq', False)
+            )
+            score_brazo_der = self._score_brazo_superior(
+                angulos['brazo_sup_der'],
+                angulos.get('hombro_elevado_der', False),
+                angulos.get('brazo_abducido_der', False)
+            )
 
-        score_antebrazo_izq = self._score_antebrazo(angulos['antebrazo_izq'])
-        score_antebrazo_der = self._score_antebrazo(angulos['antebrazo_der'])
-        score_antebrazo = self._seleccionar_por_confianza(
-            score_antebrazo_izq, conf_izq, score_antebrazo_der, conf_der
-        )
+            conf_izq = self._confianza_lado(keypoints_3d, 'izq')
+            conf_der = self._confianza_lado(keypoints_3d, 'der')
+
+            score_brazo = self._seleccionar_por_confianza(
+                score_brazo_izq, conf_izq, score_brazo_der, conf_der
+            )
+
+            score_antebrazo_izq = self._score_antebrazo(angulos['antebrazo_izq'])
+            score_antebrazo_der = self._score_antebrazo(angulos['antebrazo_der'])
+            score_antebrazo = self._seleccionar_por_confianza(
+                score_antebrazo_izq, conf_izq, score_antebrazo_der, conf_der
+            )
 
         score_muneca = self._score_muneca(angulos['muneca_izq'])
         giro_muneca = angulos['giro_muneca']
@@ -598,4 +987,6 @@ class EvaluadorRULA:
             'nivel': nivel_info['nivel'],
             'texto': nivel_info['texto'],
             'color_key': nivel_info['color_key'],
+            'vista': vista,
+            'lado_fiable': lado_fiable,
         }

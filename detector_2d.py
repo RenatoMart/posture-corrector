@@ -17,7 +17,8 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 from config import (
-    YOLO_MODELO, YOLO_CONFIANZA, KEYPOINT_CONFIANZA_MIN, KEYPOINT_NOMBRES,
+    YOLO_MODELO, YOLO_CONFIANZA, YOLO_IMGSZ, KEYPOINT_CONFIANZA_MIN,
+    KEYPOINT_NOMBRES,
     PREPROCESAMIENTO_ACTIVO, CLAHE_CLIP_LIMIT, CLAHE_TILE_SIZE,
 )
 
@@ -220,17 +221,33 @@ class Detector2D:
         # En vista lateral los hombros se ven más juntos
         separacion = ancho_estimado * 0.3  # Solo 30% de la separación real
 
-        # Determinar dirección: el hombro faltante va hacia el lado opuesto
-        if hombro_visible_idx == 5:  # Falta el derecho
-            hombro_x = hv[0] + separacion
-        else:  # Falta el izquierdo
-            hombro_x = hv[0] - separacion
+        # Dirección de colocación: perpendicular al eje del torso visible
+        # (hombro→cadera del mismo lado), no siempre horizontal. Así el
+        # esqueleto dibujado acompaña la inclinación real del cuerpo en vez
+        # de quedar congelado en la misma Y. Es solo un ajuste visual: las
+        # mediciones ergonómicas en vista lateral ya ignoran este punto
+        # fabricado (ver evaluador_rula._angulos_lateral).
+        cadera_visible_idx = 11 if hombro_visible_idx == 5 else 12
+        if cadera_visible_idx in keypoints:
+            cv_ = keypoints[cadera_visible_idx]
+            eje_x, eje_y = hv[0] - cv_[0], hv[1] - cv_[1]
+            norma_eje = (eje_x ** 2 + eje_y ** 2) ** 0.5
+            if norma_eje > 1e-3:
+                dir_x, dir_y = eje_x / norma_eje, eje_y / norma_eje
+            else:
+                dir_x, dir_y = 0.0, -1.0
+        else:
+            dir_x, dir_y = 0.0, -1.0  # sin cadera visible: torso vertical por defecto
 
-        # Misma altura Y que el hombro visible
-        hombro_y = hv[1]
+        # Perpendicular al eje del torso, hacia el lado del hombro faltante
+        perp_x, perp_y = -dir_y, dir_x
+        signo = 1 if hombro_visible_idx == 5 else -1  # falta el derecho => +; falta el izq => -
+        hombro_x = hv[0] + signo * perp_x * separacion
+        hombro_y = hv[1] + signo * perp_y * separacion
 
         # Clamp dentro del frame
         hombro_x = max(5, min(hombro_x, ancho - 5))
+        hombro_y = max(5, min(hombro_y, alto - 5))
 
         keypoints[hombro_faltante_idx] = (float(hombro_x), float(hombro_y), CONF_ESTIMADA)
 
@@ -311,7 +328,9 @@ class Detector2D:
         frame_procesado = self._preprocesar_frame(frame)
 
         # Inferencia YOLOv8-Pose (verbose=False para no llenar la consola)
-        resultados = self.modelo(frame_procesado, conf=self.confianza, verbose=False)
+        resultados = self.modelo(
+            frame_procesado, conf=self.confianza, imgsz=YOLO_IMGSZ, verbose=False
+        )
 
         if len(resultados) == 0:
             self._frames_perdidos += 1
@@ -358,7 +377,9 @@ class Detector2D:
             tuple (x1, y1, x2, y2) o None
         """
         frame_procesado = self._preprocesar_frame(frame)
-        resultados = self.modelo(frame_procesado, conf=self.confianza, verbose=False)
+        resultados = self.modelo(
+            frame_procesado, conf=self.confianza, imgsz=YOLO_IMGSZ, verbose=False
+        )
 
         if len(resultados) == 0 or resultados[0].boxes is None:
             return None

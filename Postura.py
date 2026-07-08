@@ -11,6 +11,7 @@ Uso:
     
     - Se activa la cámara de la laptop
     - Presiona 'Q' para salir
+    - Presiona 'C' sentado erguido para recalibrar tu línea base de postura
     - El panel HUD muestra el score RULA en tiempo real
     - Alarma sonora si se detecta riesgo sostenido
 """
@@ -25,7 +26,7 @@ from visualizador import Visualizador
 from config import (
     CAMERA_INDEX, ALTURA_SUJETO_CM,
     ALARMA_FRECUENCIA_HZ, ALARMA_DURACION_MS,
-    UMBRAL_FRAMES_ALARMA, UMBRAL_RULA_ALARMA,
+    UMBRAL_FRAMES_ALARMA, UMBRAL_FRAMES_LIBERA, UMBRAL_RULA_ALARMA,
 )
 
 
@@ -78,6 +79,7 @@ def main():
     print()
     print("  Controles:")
     print("    Q  → Salir")
+    print("    C  → Recalibrar postura erguida (presiona sentado derecho)")
     print()
     print("-" * 60)
 
@@ -85,6 +87,7 @@ def main():
     # VARIABLES DE CONTROL
     # ==========================================================================
     frames_riesgo = 0        # Frames consecutivos con RULA alto
+    frames_ok = 0            # Frames consecutivos con buena postura (para histéresis)
     alarma_activa = False    # Evitar alarmas repetitivas
 
     # ==========================================================================
@@ -116,21 +119,30 @@ def main():
         # ==================================================================
         resultado = None
         if keypoints_3d is not None:
-            resultado = evaluador.evaluar(keypoints_3d)
+            # Se pasa el frame (aún sin dibujos) para la detección de
+            # encorvamiento por silueta en vista lateral.
+            resultado = evaluador.evaluar(keypoints_3d, keypoints_2d, frame)
 
         # ==================================================================
         # CONTROL DE ALARMA
         # ==================================================================
-        if resultado is not None and resultado['score_final'] >= UMBRAL_RULA_ALARMA:
+        en_riesgo = (resultado is not None
+                     and resultado['score_final'] >= UMBRAL_RULA_ALARMA)
+        if en_riesgo:
             frames_riesgo += 1
+            frames_ok = 0
             if frames_riesgo >= UMBRAL_FRAMES_ALARMA and not alarma_activa:
                 emitir_alarma_async()
                 alarma_activa = True
                 print(f"[!] ALARMA: Score RULA {resultado['score_final']} "
                       f"- {resultado['texto']}")
         else:
-            frames_riesgo = 0
-            alarma_activa = False
+            # Histéresis: solo se libera tras varios frames buenos seguidos,
+            # para que un único frame ruidoso no apague ni reinicie la alarma.
+            frames_ok += 1
+            if frames_ok >= UMBRAL_FRAMES_LIBERA:
+                frames_riesgo = 0
+                alarma_activa = False
 
         # ==================================================================
         # VISUALIZACIÓN
@@ -140,10 +152,16 @@ def main():
         # Mostrar ventana
         cv2.imshow('Analisis de Postura Ergonomica - RULA', frame)
 
-        # Tecla de salida
+        # Teclas de control
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == ord('Q'):
             break
+        elif key == ord('c') or key == ord('C'):
+            # Recalibrar la línea base de postura erguida (sentado derecho):
+            # tanto el escorzo frontal como la silueta lateral del tronco.
+            elevador.recalibrar()
+            evaluador.recalibrar()
+            print("[Calibracion] Linea base de postura erguida reiniciada.")
 
     # ==========================================================================
     # LIMPIEZA

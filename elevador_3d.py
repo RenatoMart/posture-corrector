@@ -14,7 +14,9 @@ inferimos que tiene un componente de profundidad (se aleja o acerca a la cámara
 import numpy as np
 from config import (
     PROPORCIONES_CORPORALES, CAMERA_FOV_GRADOS, ALTURA_SUJETO_CM,
-    SEGMENTOS_CADENA, SUAVIZADO_ALPHA
+    SEGMENTOS_CADENA, SUAVIZADO_ALPHA,
+    ANCHO_HOMBROS_MIN_PX, ESCORZO_DEADZONE, ESCORZO_DZ_MAX_FRAC,
+    CALIB_ALPHA_SUBIDA, CALIB_ALPHA_BAJADA,
 )
 
 
@@ -40,6 +42,21 @@ class Elevador3D:
         # Buffer de suavizado temporal (media móvil exponencial)
         self.historial = {}
         self.alpha = SUAVIZADO_ALPHA
+
+        # Líneas base de calibración relativa: ratio segmento/ancho_hombros de
+        # la postura MÁS erguida observada, por tipo de referencia (ver
+        # _elevar_sagital). Invariante a la distancia a la cámara.
+        self._baselines = {}
+
+    def recalibrar(self):
+        """
+        Resetea la línea base personal de postura erguida.
+
+        Llamar con la persona sentada erguida (tecla 'C' en la app): la nueva
+        referencia se adopta en ~1 segundo y el escorzo del cuello/torso pasa
+        a medirse contra esa postura.
+        """
+        self._baselines = {}
 
     def _estimar_focal(self, ancho_frame):
         """
@@ -74,6 +91,158 @@ class Elevador3D:
     def _hombro_estimado(self, keypoints_2d):
         """Detecta si algún hombro fue estimado (vista lateral)."""
         return self._es_punto_estimado(keypoints_2d, 5) or self._es_punto_estimado(keypoints_2d, 6)
+
+    def _dz_por_escorzo(self, seg_proj_cm, seg_real_cm):
+        """
+        Calcula la profundidad (Z) implícita en el escorzo de un segmento.
+
+        Si un segmento de longitud real conocida aparece más corto de lo
+        esperado en la imagen, la diferencia se debe a que está inclinado en
+        profundidad. Por Pitágoras: dz = sqrt(real² - proyectado²).
+
+        Se aplica una zona muerta (ESCORZO_DEADZONE) para no reaccionar a
+        acortamientos pequeños, que casi siempre son variación corporal entre
+        personas y no postura. La estimación se calcula respecto al borde de la
+        zona muerta para que dz crezca de forma continua desde 0 (sin saltos).
+
+        Returns:
+            float: profundidad estimada en cm (0 si no hay escorzo relevante).
+        """
+        if seg_real_cm <= 1e-6:
+            return 0.0
+
+        base = seg_real_cm * ESCORZO_DEADZONE
+        if seg_proj_cm >= base:
+            return 0.0
+
+        dz = np.sqrt(base ** 2 - seg_proj_cm ** 2)
+        # Limitar para estabilidad (evita saltos enormes por detecciones espurias)
+        return min(dz, seg_real_cm * ESCORZO_DZ_MAX_FRAC)
+
+    def _ref_cabeza_2d(self, keypoints_2d):
+        """
+        Punto de referencia 2D de la cabeza, su fracción antropométrica y el
+        tipo de referencia usado.
+
+        Usa la misma prioridad que el evaluador RULA (orejas > ojos > nariz)
+        para que el cálculo de profundidad sea coherente con el del ángulo del
+        cuello. El tipo permite mantener una línea base de calibración
+        independiente por referencia (la distancia hombros→orejas no es la
+        misma que hombros→nariz).
+
+        Returns:
+            (punto_xy, fraccion_altura, tipo) o (None, 0, None) si no hay referencia.
+        """
+        if 3 in keypoints_2d and 4 in keypoints_2d:
+            return self._punto_medio(keypoints_2d[3], keypoints_2d[4]), 0.13, 'orejas'
+        if 1 in keypoints_2d and 2 in keypoints_2d:
+            return self._punto_medio(keypoints_2d[1], keypoints_2d[2]), 0.14, 'ojos'
+        if 3 in keypoints_2d:
+            return (keypoints_2d[3][0], keypoints_2d[3][1]), 0.13, 'oreja'
+        if 4 in keypoints_2d:
+            return (keypoints_2d[4][0], keypoints_2d[4][1]), 0.13, 'oreja'
+        if 0 in keypoints_2d:
+            return (keypoints_2d[0][0], keypoints_2d[0][1]), 0.15, 'nariz'
+        return None, 0, None
+
+    def _actualizar_baseline(self, clave, ratio):
+        """
+        Mantiene la línea base (postura más erguida) de un ratio escala-invariante.
+
+        Sube rápido cuando aparece una postura más erguida (~1 s de evidencia
+        sostenida, para no adoptar picos de ruido de golpe) y baja lentísimo,
+        de modo que estar encorvado mucho rato NO erosiona la referencia.
+        """
+        base = self._baselines.get(clave)
+        if base is None:
+            self._baselines[clave] = ratio
+            return ratio
+        if ratio > base:
+            base += (ratio - base) * CALIB_ALPHA_SUBIDA
+        else:
+            base += (ratio - base) * CALIB_ALPHA_BAJADA
+        self._baselines[clave] = base
+        return base
+
+    def _dz_calibrado(self, clave, ratio, seg_real_cm):
+        """
+        Profundidad por escorzo RELATIVO a la línea base personal.
+
+        En vez de comparar la longitud proyectada contra una proporción
+        antropométrica absoluta (sensible a la altura configurada, al FOV y a
+        la variación entre personas), compara el ratio segmento/ancho_hombros
+        actual contra el mejor ratio observado de la propia persona. Si el
+        segmento se ve un X% más corto que erguido, ese acortamiento se
+        convierte a profundidad con la misma geometría de _dz_por_escorzo.
+        """
+        base = self._actualizar_baseline(clave, ratio)
+        if base <= 1e-6:
+            return 0.0
+        seg_proj_eq = seg_real_cm * min(ratio / base, 1.0)
+        return self._dz_por_escorzo(seg_proj_eq, seg_real_cm)
+
+    def _reubicar_a_z(self, px, py, z, focal, cx, cy):
+        """Re-proyecta un punto 2D a 3D a una profundidad Z dada."""
+        return np.array([(px - cx) * z / focal, (py - cy) * z / focal, z])
+
+    def _elevar_sagital(self, kp2d, kp3d, z_ref, focal, cx, cy,
+                        hombro_est, caderas_est, ancho_hombros_px):
+        """
+        Reasigna la profundidad de caderas y cabeza según el escorzo, para
+        revelar la inclinación sagital (encorvarse / cabeza adelantada) que en
+        vista frontal no aparece en X-Y.
+
+        El escorzo se mide de forma RELATIVA: cada ratio segmento/ancho_hombros
+        se compara contra la línea base de la postura más erguida de la propia
+        persona (ver _dz_calibrado). Así la detección de encorvamiento frontal
+        funciona sin necesidad de ver las caderas (caso típico de escritorio,
+        donde el encorvamiento se manifiesta como cabeza adelantada) y sin
+        depender de acertar ALTURA_SUJETO_CM ni el FOV de la cámara.
+
+        Solo se aplica en vista frontal/ángulo fiable (ambos hombros reales y
+        bien separados). En vista lateral la inclinación YA se ve en X-Y, así
+        que no se añade nada (evita contar dos veces).
+        """
+        # Vista lateral o hombros poco fiables: no tocar (ya se mide en X-Y)
+        if hombro_est or ancho_hombros_px < ANCHO_HOMBROS_MIN_PX:
+            return
+        if 5 not in kp2d or 6 not in kp2d:
+            return
+
+        mid_hombro = self._punto_medio(kp2d[5], kp2d[6])
+
+        # --- TRONCO: profundidad de las caderas por escorzo del torso ---
+        # Solo con caderas reales (si fueron estimadas, el torso es inventado).
+        if not caderas_est and 11 in kp3d and 12 in kp3d:
+            mid_cadera = self._punto_medio(kp2d[11], kp2d[12])
+            torso_px = self._distancia_2d(mid_hombro, mid_cadera)
+            seg_real = self.segmentos_reales['hombro_cadera']
+            ratio_torso = torso_px / ancho_hombros_px
+            dz = self._dz_calibrado('torso', ratio_torso, seg_real)
+            if dz > 0:
+                # Caderas más profundas que los hombros → tronco inclinado.
+                # (El signo no afecta la magnitud de flexión que mide RULA.)
+                z_cadera = z_ref + dz
+                for idx in (11, 12):
+                    px, py, _ = kp2d[idx]
+                    kp3d[idx] = self._reubicar_a_z(px, py, z_cadera, focal, cx, cy)
+
+        # --- CUELLO: cabeza adelantada (forward-head) por escorzo del cuello ---
+        # Al encorvarse frente al escritorio la cabeza baja y se adelanta: la
+        # distancia hombros→cabeza se acorta respecto a la línea base erguida.
+        cabeza_xy, frac, tipo_ref = self._ref_cabeza_2d(kp2d)
+        if cabeza_xy is not None:
+            cuello_px = self._distancia_2d(mid_hombro, cabeza_xy)
+            seg_real = self.altura_cm * frac
+            ratio_cuello = cuello_px / ancho_hombros_px
+            dz = self._dz_calibrado(f'cuello_{tipo_ref}', ratio_cuello, seg_real)
+            if dz > 0:
+                # Cabeza adelantada hacia la cámara (más cerca = menor Z).
+                z_cabeza = z_ref - dz
+                for idx in (0, 1, 2, 3, 4):
+                    if idx in kp3d and idx in kp2d:
+                        px, py, _ = kp2d[idx]
+                        kp3d[idx] = self._reubicar_a_z(px, py, z_cabeza, focal, cx, cy)
 
     def elevar(self, keypoints_2d, frame_shape):
         """
@@ -116,12 +285,14 @@ class Elevador3D:
             (hombro_der[0], hombro_der[1])
         )
 
-        if not caderas_est and not hombro_est and ancho_hombros_px > 20:
-            # Caso ideal: todo es real, usar torso
-            ref_pixels = self._distancia_2d(mid_hombro, mid_cadera)
-            ref_real = self.segmentos_reales['hombro_cadera']
-        elif not hombro_est and ancho_hombros_px > 20:
-            # Caderas estimadas pero hombros reales y separados: usar ancho hombros
+        if not hombro_est and ancho_hombros_px > 20:
+            # Hombros reales y separados (vista frontal o en ángulo):
+            # usar el ANCHO DE HOMBROS como referencia de profundidad.
+            #
+            # Clave: a diferencia del torso, el ancho de hombros NO se acorta
+            # cuando la persona se inclina hacia adelante/atrás. Por eso da una
+            # profundidad de referencia estable e independiente de la postura,
+            # y sirve de ancla para medir el escorzo del tronco (ver Paso 2.5).
             ref_pixels = ancho_hombros_px
             ref_real = self.segmentos_reales['ancho_hombros']
         else:
@@ -209,6 +380,18 @@ class Elevador3D:
                 X = (hijo_px - cx) * hijo_z / focal
                 Y = (hijo_py - cy) * hijo_z / focal
                 keypoints_3d[hijo_idx] = np.array([X, Y, hijo_z])
+
+        # =====================================================================
+        # Paso 2.5: Elevación sagital (inclinación frontal hacia adelante)
+        # =====================================================================
+        # En vista frontal, encorvarse o adelantar la cabeza son movimientos en
+        # profundidad (Z) invisibles en X-Y. Aquí se recupera esa profundidad a
+        # partir del escorzo del torso y del cuello, anclando en el plano de los
+        # hombros (cuyo ancho no se acorta al inclinarse).
+        self._elevar_sagital(
+            keypoints_2d, keypoints_3d, z_ref, focal, cx, cy,
+            hombro_est, caderas_est, ancho_hombros_px,
+        )
 
         # =====================================================================
         # Paso 4: Agregar puntos virtuales (cuello, centro de torso)
