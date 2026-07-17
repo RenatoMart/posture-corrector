@@ -18,24 +18,20 @@ El sistema ha sido adaptado específicamente para **entornos reales de oficina**
 
 ---
 
-## 🏗️ Arquitectura y Fundamentos Teóricos (Híbrida de 3 Fases)
+## 🏗️ Arquitectura y Fundamentos Teóricos (3 Fases)
 
 El flujo de procesamiento se divide en 3 módulos principales, sustentados en principios matemáticos y de visión computacional:
 
 ### 1. Fase de Detección 2D y Preprocesamiento (`detector_2d.py`)
 Antes de pasar la imagen a la red neuronal, se aplica un filtro para estabilizar las condiciones de luz:
 - **Preprocesamiento CLAHE (Contrast Limited Adaptive Histogram Equalization):** En lugar de ecualizar la imagen BGR entera (lo que distorsiona los colores), la imagen se convierte al espacio de color **LAB**. El filtro CLAHE se aplica *únicamente* al canal **L** (Luminosidad). Esto mejora drásticamente el contraste local en zonas oscuras o con contraluz, previniendo la amplificación del ruido mediante el parámetro `clipLimit`.
-- **Inferencia (YOLOv8-Nano-Pose):** Se extraen las coordenadas $(x, y)$ de los 17 puntos anatómicos clave. La red proporciona una métrica de "confianza" ($P_c$) para cada punto.
-- **Inferencia Anatómica:** Si la oclusión de la cámara oculta puntos clave (ej. vista lateral), el sistema emplea heurísticas geométricas. Por ejemplo, estima el hombro oculto calculando un vector ortogonal al eje del tronco, limitando su separación al 30% del ancho biacromial visible.
+- **Inferencia (MediaPipe Pose Landmarker):** Se extraen **33 landmarks** anatómicos, de los que se usan los 17 índices estilo COCO. MediaPipe entrega tanto los puntos 2D en la imagen (con una métrica de *visibilidad* por punto) como los **world landmarks: coordenadas 3D reales en metros** con el origen en el centro de las caderas. Rastrea automáticamente a una sola persona entre frames.
 
-### 2. Fase de Elevación Geométrica a 3D (`elevador_3d.py`)
-Dado que una sola cámara carece de información de profundidad, el sistema reconstruye el eje Z utilizando antropometría y óptica básica:
-- **Modelo de Cámara Pinhole:** Se estima la distancia focal ($f$) en píxeles usando el FOV (Field of View) de la cámara:  
-  $f = \frac{ancho\_frame / 2}{\tan(FOV / 2)}$
-- **Proporciones de Drillis & Contini:** Se usan tablas estadísticas poblacionales para conocer la longitud real de los segmentos corporales en función de la altura total del sujeto (ej. *Torso = Altura × 0.288*).
-- **Cálculo de Profundidad (Z-Lifting):** Si la proyección 2D de un segmento corporal (en píxeles) aparece más corta que su longitud teórica proyectada, la diferencia se atribuye matemáticamente al escorzo (el segmento se aleja o acerca a la lente). Usando el teorema de Pitágoras en 3D, el sistema despeja el vector de profundidad ($Z$) para cada articulación hija partiendo del centro del torso.
-- **Detección de Encorvamiento Frontal (Escorzo Calibrado):** De frente, encorvarse es un movimiento en profundidad invisible en X-Y. El sistema lo recupera midiendo el acortamiento (escorzo) del cuello y el torso **relativo a tu postura más erguida** (ratio segmento/ancho de hombros, invariante a la distancia a la cámara), anclado en el plano de los hombros (cuyo ancho no se acorta al inclinarse).
-- **Suavizado Temporal:** Se aplica una **Media Móvil Exponencial (EMA)** a los vectores 3D resultantes para eliminar el *jitter* (temblor) de los keypoints en tiempo real.
+### 2. Fase de Ensamblado de la Pose 3D (`elevador_3d.py`)
+A diferencia de YOLO (que solo daba 2D y obligaba a *estimar* la profundidad por escorzo, algo frágil que fallaba justo al encorvarse), **MediaPipe ya mide la profundidad**. Por eso esta fase se simplifica a:
+- **Pose 3D real:** Se toman directamente los world landmarks (X derecha, Y abajo, Z profundidad, en cm). Encorvarse o adelantar la cabeza son movimientos en Z que ahora se ven de forma directa en **cualquier vista** (frontal incluida), sin trucos geométricos.
+- **Puntos virtuales:** Se añaden el *cuello* (punto medio entre hombros) y el *centro de cadera* (punto medio entre caderas) que consume el evaluador RULA.
+- **Suavizado Temporal:** Se aplica una **Media Móvil Exponencial (EMA)** a los vectores 3D para eliminar el *jitter* (temblor) residual de los keypoints en tiempo real.
 
 ### 3. Fase de Evaluación Biomecánica RULA (`evaluador_rula.py`)
 El Método RULA divide el cuerpo en el Grupo A (brazos, muñecas) y Grupo B (cuello, tronco, piernas). Las matemáticas detrás de esta fase incluyen:
@@ -56,8 +52,8 @@ De costado y sentado, la cadera queda oculta tras el escritorio y el detector la
 
 - `Postura.py`: Archivo principal de ejecución. Maneja el ciclo de la cámara, hilos de alarma y orquesta los demás módulos.
 - `config.py`: Configuraciones globales. Aquí puedes ajustar los límites RULA, variables de la alarma, uso de GPU/CPU, umbrales de detección, calibración y activación del filtro CLAHE.
-- `detector_2d.py`: Clase `Detector2D` (YOLO y preprocesamiento).
-- `elevador_3d.py`: Clase `Elevador3D` (Geometría, escorzo calibrado y suavizado).
+- `detector_2d.py`: Clase `Detector2D` (MediaPipe Pose Landmarker y preprocesamiento). Devuelve la pose 2D en píxeles y la pose 3D real (world landmarks). El modelo `.task` se descarga solo la primera vez.
+- `elevador_3d.py`: Clase `Elevador3D` (ensamblado de la pose 3D: puntos virtuales de cuello/cadera y suavizado).
 - `evaluador_rula.py`: Clase `EvaluadorRULA` (Detección de vista y lógica ergonómica).
 - `detector_encorvamiento.py`: Clase `AnalizadorSiluetaLateral` (Encorvamiento lateral por bordes Canny).
 - `visualizador.py`: Encargado de renderizar el HUD (Panel de control semitransparente), el esqueleto de colores, barras de riesgo y los ángulos sobre la imagen de la cámara.
@@ -67,13 +63,21 @@ De costado y sentado, la cadera queda oculta tras el escritorio y el detector la
 
 ## 🚀 Requisitos e Instalación
 
-Necesitarás Python 3.8 o superior. Instala las dependencias requeridas ejecutando:
+Necesitarás Python 3.9 o superior (probado en 3.12). Instala las dependencias requeridas ejecutando:
 
 ```bash
-pip install ultralytics opencv-python numpy
+pip install -r requirements.txt
+```
+
+O bien, manualmente:
+
+```bash
+pip install mediapipe opencv-python numpy
 ```
 
 *(Nota: En Windows, el sonido utiliza la librería nativa `winsound`, la cual ya viene incluida en Python).*
+
+> **📦 Modelos de pose:** Los archivos de modelo de MediaPipe (`pose_landmarker_*.task`, hasta 30 MB) **no** están incluidos en el repositorio. El programa los **descarga automáticamente** la primera vez que se ejecuta, según el `MP_MODEL_COMPLEXITY` configurado, y los guarda junto al código. No necesitas hacer nada manual, solo tener conexión a internet en el primer arranque.
 
 ---
 
@@ -84,6 +88,15 @@ Para iniciar el sistema, simplemente ejecuta:
 ```bash
 python Postura.py
 ```
+
+Opciones de línea de comandos:
+
+```bash
+python Postura.py --gpu   # intenta acelerar por GPU
+python Postura.py --cpu   # fuerza CPU
+```
+
+> **⚠️ Sobre la GPU:** la rueda oficial de **MediaPipe para Windows en Python está compilada solo para CPU** (*GPU processing is disabled in build flags*). El flag `--gpu` intenta usar la GPU y, si el build no lo permite (tu caso en Windows), **cae automáticamente a CPU** avisándote por consola — nunca se queda sin funcionar. Habilitar GPU de verdad requeriría recompilar MediaPipe desde el código fuente (o correr en Linux). En Windows, la forma real de ganar velocidad es bajar `MP_MODEL_COMPLEXITY` (2→1→0). Nota: el delegado `XNNPACK` que ves al arrancar **ya es** una optimización de CPU (multinúcleo/SIMD).
 
 ### Controles durante la ejecución:
 - **`Q`**: Salir del programa y cerrar la cámara.
@@ -105,6 +118,6 @@ Puedes abrir el archivo `config.py` para adaptar el programa a tus necesidades. 
 - `CAMERA_INDEX`: Cambia a `1` si usas una cámara web externa.
 - `UMBRAL_FRAMES_ALARMA`: Número de frames (tiempo) que debe mantenerse una mala postura antes de que suene la alarma.
 - `PREPROCESAMIENTO_ACTIVO`: Cambia a `False` si tienes iluminación de estudio perfecta y deseas ganar 1-2 FPS.
-- `ALTURA_SUJETO_CM`: Altura en cm usada para mejorar la precisión del modelo 3D.
-- `YOLO_MODELO` / `YOLO_IMGSZ`: Cambia a `'yolov8s-pose.pt'` o sube `YOLO_IMGSZ` a `960` para más precisión (a costa de FPS en CPU).
+- `MP_MODEL_COMPLEXITY`: `0` (lite, más rápido), `1` (full, equilibrado, por defecto) o `2` (heavy, más preciso pero más lento en CPU). El modelo correspondiente se descarga solo.
+- `MP_VIS_MIN`: Visibilidad mínima (0-1) para usar un landmark. Bájalo si quieres que puntos parcialmente ocluidos (ej. caderas tras el escritorio) se usen igualmente.
 - `ENCORVADO_ACTIVO`: Activa/desactiva la detección de encorvamiento lateral por silueta. Los parámetros `ENCORVADO_*` ajustan su sensibilidad: sube `ENCORVADO_RESIDUO_MAX` para ser más permisivo con fondos complejos, o baja `ENCORVADO_GANANCIA` si detecta encorvamiento de más.

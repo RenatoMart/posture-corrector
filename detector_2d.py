@@ -1,63 +1,159 @@
 """
-detector_2d.py — Fase 1: Extracción 2D Ultrarrápida con YOLOv8-Pose.
+detector_2d.py — Fase 1: Extracción de pose con MediaPipe Pose Landmarker.
 
-Utiliza el modelo YOLOv8-Nano-Pose para extraer los 17 keypoints COCO
-de la persona detectada en cada frame. Optimizado para velocidad en
-tiempo real sin necesidad de GPU.
+Reemplaza a YOLOv8-Pose. La diferencia clave para este proyecto:
 
-Mejoras:
-    - Preprocesamiento CLAHE para mejorar detección en baja iluminación
-    - Detección parcial: funciona con solo el torso superior visible
-    - Estimación de caderas cuando no son visibles en el frame
-    - Detección con 1 solo hombro (vista lateral de cámara)
-    - Estimación del hombro faltante para vistas no frontales
+    - YOLO daba 17 keypoints SOLO en 2D (x, y). La profundidad (encorvarse,
+      cabeza adelantada) había que estimarla con geometría por escorzo, que es
+      frágil y fallaba justo cuando la persona estaba encorvada.
+    - MediaPipe da 33 landmarks CON profundidad real: los "world landmarks" son
+      coordenadas 3D en metros, con origen en el centro de las caderas. Así la
+      postura sagital se mide en 3D real y directo, en cualquier vista.
+
+Usa la API moderna de MediaPipe (`mediapipe.tasks`), ya que la antigua
+`mp.solutions.pose` fue retirada. El modelo `.task` se descarga solo la primera
+vez (igual que YOLO descargaba su `.pt`).
+
+Salida de `detectar()`:
+    - keypoints_2d:   {coco_idx: (x_px, y_px, visibilidad)} para dibujar el
+                      esqueleto y clasificar la vista de cámara.
+    - keypoints_world:{coco_idx: np.array([X, Y, Z]) en cm} con la pose 3D real
+                      (X derecha, Y abajo, Z profundidad), lista para el evaluador.
+
+Los 33 landmarks de MediaPipe se mapean a los 17 índices COCO que ya usaba el
+resto del sistema (evaluador_rula, visualizador, config), por lo que esos
+módulos siguen funcionando sin cambios.
 """
 
-from ultralytics import YOLO
+import os
+import sys
+import contextlib
+import urllib.request
+
+# --- Silenciar los avisos informativos de MediaPipe / TensorFlow Lite ---------
+# NO son errores: son mensajes del motor C++ (XNNPACK, "feedback manager", absl).
+# Estas variables deben fijarse ANTES de importar mediapipe para tener efecto.
+os.environ.setdefault('GLOG_minloglevel', '2')      # oculta INFO y WARNING del C++
+os.environ.setdefault('GLOG_logtostderr', '0')
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')  # oculta logs de TensorFlow Lite
+
+import warnings
+# Aviso de deprecación de protobuf (inofensivo, depende de la versión instalada)
+warnings.filterwarnings('ignore', category=UserWarning, module=r'google\.protobuf.*')
+warnings.filterwarnings('ignore', message=r'.*SymbolDatabase\.GetPrototype.*')
+
 import cv2
 import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
+try:  # Bajar también la verbosidad del logger absl que usa MediaPipe
+    from absl import logging as _absl_logging
+    _absl_logging.set_verbosity(_absl_logging.ERROR)
+except Exception:
+    pass
+
 from config import (
-    YOLO_MODELO, YOLO_CONFIANZA, YOLO_IMGSZ, KEYPOINT_CONFIANZA_MIN,
-    KEYPOINT_NOMBRES,
+    MP_MODEL_COMPLEXITY, MP_MODELOS, MP_USAR_GPU,
+    MP_MIN_DET_CONF, MP_MIN_TRACK_CONF, MP_MIN_PRESENCE_CONF, MP_PRESENCE_MIN,
     PREPROCESAMIENTO_ACTIVO, CLAHE_CLIP_LIMIT, CLAHE_TILE_SIZE,
 )
 
 
-# Confianza asignada a keypoints estimados (no detectados directamente)
-CONF_ESTIMADA = 0.25
+@contextlib.contextmanager
+def _silenciar_stderr_c():
+    """
+    Redirige temporalmente el descriptor de stderr (nivel del sistema) a nulo.
+
+    Se usa solo mientras se carga el modelo de MediaPipe, donde el motor C++
+    escupe unos avisos informativos (XNNPACK, feedback manager, absl) que no se
+    pueden filtrar desde Python. Si la carga fallara de verdad, MediaPipe lanza
+    una excepción Python, que NO se silencia.
+    """
+    try:
+        fd = sys.stderr.fileno()
+    except (AttributeError, ValueError):
+        # stderr sin descriptor real (p.ej. redirigido en un IDE): no hacer nada
+        yield
+        return
+    with open(os.devnull, 'w') as devnull:
+        guardado = os.dup(fd)
+        try:
+            sys.stderr.flush()
+            os.dup2(devnull.fileno(), fd)
+            yield
+        finally:
+            sys.stderr.flush()
+            os.dup2(guardado, fd)
+            os.close(guardado)
+
+
+# =============================================================================
+# Mapeo MediaPipe (33 landmarks) → COCO (17 keypoints)
+# Índices MediaPipe: https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
+# =============================================================================
+_MP_A_COCO = {
+    0: 0,    # nariz
+    2: 1,    # ojo izquierdo
+    5: 2,    # ojo derecho
+    7: 3,    # oreja izquierda
+    8: 4,    # oreja derecha
+    11: 5,   # hombro izquierdo
+    12: 6,   # hombro derecho
+    13: 7,   # codo izquierdo
+    14: 8,   # codo derecho
+    15: 9,   # muñeca izquierda
+    16: 10,  # muñeca derecha
+    23: 11,  # cadera izquierda
+    24: 12,  # cadera derecha
+    25: 13,  # rodilla izquierda
+    26: 14,  # rodilla derecha
+    27: 15,  # tobillo izquierdo
+    28: 16,  # tobillo derecho
+}
+
+# Factor metros → centímetros (los world landmarks vienen en metros)
+_M_A_CM = 100.0
+
+# Directorio del proyecto (para guardar el modelo .task junto al código)
+_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class Detector2D:
     """
-    Detector de pose 2D basado en YOLOv8-Pose.
+    Detector de pose basado en MediaPipe Pose Landmarker (Tasks API).
 
-    Extrae las coordenadas (x, y) en píxeles de los 17 keypoints COCO
-    de la persona con mayor confianza en el frame.
+    Extrae la pose de la persona más prominente en el frame y la entrega en dos
+    representaciones alineadas por índice COCO: 2D en píxeles (para dibujar y
+    clasificar la vista) y 3D real en cm (world landmarks, para el evaluador).
 
-    Soporta:
-    - Detección parcial (solo torso superior visible)
-    - Vista lateral (1 solo hombro visible)
-    - Estimación de hombro y caderas faltantes
-    - Tracking de persona principal entre frames
+    MediaPipe rastrea automáticamente a una sola persona entre frames (modo
+    VIDEO), por lo que ya no hace falta el tracking por centroide del detector
+    anterior.
     """
 
-    RATIO_TORSO_HOMBROS = 1.4
-
-    # Frames sin detección antes de resetear el tracker
-    _MAX_FRAMES_PERDIDOS = 15
-    # Distancia máxima en px para seguir considerando la misma persona
-    _MAX_DIST_TRACKING = 250
-
-    def __init__(self, modelo=YOLO_MODELO, confianza=YOLO_CONFIANZA):
+    def __init__(self, modelo=None, confianza=MP_MIN_DET_CONF, usar_gpu=MP_USAR_GPU):
         """
         Args:
-            modelo: Nombre del modelo YOLOv8-Pose (se descarga automáticamente).
-            confianza: Umbral mínimo de confianza para detección de persona.
+            modelo: ruta a un .task concreto; si es None, se elige según
+                MP_MODEL_COMPLEXITY y se descarga automáticamente si falta.
+            confianza: confianza mínima de detección de la persona.
+            usar_gpu: intentar el delegado GPU de MediaPipe. Si el build no lo
+                soporta (caso de Windows, GPU deshabilitada en la librería) cae
+                automáticamente a CPU. Se puede forzar con `python Postura.py --gpu`.
         """
-        self.modelo = YOLO(modelo)
-        self.confianza = confianza
+        ruta_modelo = modelo or self._asegurar_modelo(MP_MODEL_COMPLEXITY)
 
-        # Crear objeto CLAHE reutilizable (más eficiente que recrearlo cada frame)
+        self.landmarker, self.delegado = self._crear_landmarker(
+            ruta_modelo, confianza, usar_gpu
+        )
+        self.presence_min = MP_PRESENCE_MIN
+
+        # Timestamp monótono creciente (ms) que exige el modo VIDEO
+        self._ts_ms = 0
+
+        # CLAHE reutilizable para mejorar detección en baja iluminación
         if PREPROCESAMIENTO_ACTIVO:
             self.clahe = cv2.createCLAHE(
                 clipLimit=CLAHE_CLIP_LIMIT,
@@ -68,325 +164,163 @@ class Detector2D:
         else:
             self.clahe = None
 
-        # Estado del tracker de persona principal
-        self._centroide_rastreado = None  # (cx, cy) en píxeles del frame anterior
-        self._frames_perdidos = 0
+        print(f"[Detector2D] MediaPipe Pose Landmarker cargado "
+              f"(modelo={os.path.basename(ruta_modelo)}, delegado={self.delegado}, "
+              f"presencia_min={self.presence_min}).")
 
-        print(f"[Detector2D] Modelo '{modelo}' cargado correctamente.")
+    @staticmethod
+    def _crear_landmarker(ruta_modelo, confianza, usar_gpu):
+        """
+        Crea el PoseLandmarker con el delegado pedido (GPU o CPU).
+
+        Si se pide GPU pero el build de MediaPipe no lo soporta (típico en
+        Windows: "GPU processing is disabled in build flags"), se captura el
+        error y se reintenta con CPU, avisando por consola. Nunca deja el
+        sistema sin detector por pedir GPU.
+
+        Returns:
+            tuple (landmarker, nombre_delegado_usado)
+        """
+        Delegate = mp_python.BaseOptions.Delegate
+
+        def _construir(delegate):
+            opciones = mp_vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(
+                    model_asset_path=ruta_modelo, delegate=delegate),
+                running_mode=mp_vision.RunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=confianza,
+                min_pose_presence_confidence=MP_MIN_PRESENCE_CONF,
+                min_tracking_confidence=MP_MIN_TRACK_CONF,
+                output_segmentation_masks=False,
+            )
+            # La creación del modelo emite avisos informativos del C++; se silencian.
+            with _silenciar_stderr_c():
+                return mp_vision.PoseLandmarker.create_from_options(opciones)
+
+        if usar_gpu:
+            print("[Detector2D] Intentando acelerar por GPU...")
+            try:
+                landmarker = _construir(Delegate.GPU)
+                print("[Detector2D] GPU ACTIVADA.")
+                return landmarker, 'GPU'
+            except Exception as e:
+                motivo = str(e).splitlines()[0] if str(e) else type(e).__name__
+                print("[Detector2D] GPU no disponible en este equipo "
+                      f"({motivo}). Usando CPU.")
+
+        return _construir(Delegate.CPU), 'CPU'
+
+    @staticmethod
+    def _asegurar_modelo(complejidad):
+        """
+        Devuelve la ruta local del modelo .task, descargándolo si no existe.
+        """
+        nombre, url = MP_MODELOS.get(complejidad, MP_MODELOS[1])
+        ruta = os.path.join(_DIR, nombre)
+        if not os.path.exists(ruta):
+            print(f"[Detector2D] Descargando modelo '{nombre}' (una sola vez)...")
+            urllib.request.urlretrieve(url, ruta)
+            print(f"[Detector2D] Modelo guardado en {ruta}")
+        return ruta
 
     def _preprocesar_frame(self, frame):
         """
-        Mejora el frame para detección en condiciones de iluminación difíciles.
-        
-        Aplica CLAHE (Contrast Limited Adaptive Histogram Equalization) solo
-        en el canal de luminosidad (espacio LAB) para mejorar contraste sin
-        distorsionar colores. Coste: ~1-2ms por frame.
-        
-        Args:
-            frame: Imagen BGR de OpenCV (numpy array HxWx3).
-            
-        Returns:
-            Frame preprocesado con contraste mejorado.
+        Mejora el frame para condiciones de iluminación difíciles.
+
+        Aplica CLAHE solo en el canal de luminosidad (espacio LAB) para mejorar
+        el contraste sin distorsionar colores. Coste ~1-2 ms por frame.
         """
         if self.clahe is None:
             return frame
 
-        # Convertir a LAB para ecualizar solo luminosidad
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l_channel, a_channel, b_channel = cv2.split(lab)
-
-        # Aplicar CLAHE al canal de luminosidad
         l_eq = self.clahe.apply(l_channel)
-
-        # Reconstruir imagen
         lab_eq = cv2.merge([l_eq, a_channel, b_channel])
-        resultado = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
-
-        return resultado
-
-    def _seleccionar_persona(self, resultados):
-        """
-        Selecciona el índice de la persona principal en los tensores de YOLO.
-
-        Estrategia:
-        - Sin historial (primer frame o tras pérdida): elegir la persona con mayor
-          bounding box (más grande = más cercana a la cámara).
-        - Con historial activo y múltiples personas: seguir a la más cercana al
-          centroide registrado en el frame anterior (tracking por centroide).
-        - Si la persona rastreada se aleja más de _MAX_DIST_TRACKING px, se
-          reinicia el tracker y se vuelve a elegir por tamaño.
-
-        Returns:
-            int: índice en los tensores de YOLO, o None si no hay detecciones.
-        """
-        tiene_boxes = (
-            resultados[0].boxes is not None
-            and resultados[0].boxes.data.shape[0] > 0
-        )
-        tiene_kps = (
-            resultados[0].keypoints is not None
-            and resultados[0].keypoints.data.shape[0] > 0
-        )
-
-        if not tiene_boxes or not tiene_kps:
-            self._frames_perdidos += 1
-            if self._frames_perdidos >= self._MAX_FRAMES_PERDIDOS:
-                self._centroide_rastreado = None
-            return None
-
-        boxes_np = resultados[0].boxes.xyxy.cpu().numpy()  # (n, 4)
-        n = boxes_np.shape[0]
-
-        centroides = np.column_stack([
-            (boxes_np[:, 0] + boxes_np[:, 2]) / 2,
-            (boxes_np[:, 1] + boxes_np[:, 3]) / 2,
-        ])
-        areas = (boxes_np[:, 2] - boxes_np[:, 0]) * (boxes_np[:, 3] - boxes_np[:, 1])
-
-        if self._centroide_rastreado is not None and n > 1:
-            # Tracking activo con múltiples personas: seguir la más cercana
-            dists = np.linalg.norm(
-                centroides - np.array(self._centroide_rastreado), axis=1
-            )
-            idx_min = int(np.argmin(dists))
-            if dists[idx_min] <= self._MAX_DIST_TRACKING:
-                idx = idx_min
-            else:
-                # La persona rastreada desapareció: reiniciar con la más grande
-                idx = int(np.argmax(areas))
-                self._centroide_rastreado = None
-        else:
-            # Sin historial o una sola persona: la más grande (más cercana)
-            idx = int(np.argmax(areas))
-
-        self._centroide_rastreado = (float(centroides[idx, 0]), float(centroides[idx, 1]))
-        self._frames_perdidos = 0
-        return idx
-
-    def _estimar_hombro_faltante(self, keypoints, frame_shape):
-        """
-        Estima el hombro faltante cuando la cámara está en ángulo lateral.
-        
-        Usa la orientación inferida del cuerpo (orejas, nariz, cadera visible)
-        para estimar la posición del hombro oculto. Se asigna confianza baja
-        para que el evaluador pondere correctamente.
-        
-        Args:
-            keypoints: dict con al menos 1 hombro detectado.
-            frame_shape: tuple (alto, ancho, canales).
-            
-        Returns:
-            dict actualizado con hombro estimado.
-        """
-        alto, ancho = frame_shape[:2]
-
-        tiene_izq = 5 in keypoints
-        tiene_der = 6 in keypoints
-
-        if tiene_izq and tiene_der:
-            return keypoints  # No falta ninguno
-
-        # El hombro visible
-        hombro_visible_idx = 5 if tiene_izq else 6
-        hombro_faltante_idx = 6 if tiene_izq else 5
-        hv = keypoints[hombro_visible_idx]
-
-        # Estimar ancho de hombros: usar orejas si están disponibles,
-        # o usar una proporción del tamaño de la persona en el frame
-        ancho_estimado = 0
-
-        # Método 1: Usar distancia entre orejas × 2.2 como proxy
-        if 3 in keypoints and 4 in keypoints:
-            dist_orejas = abs(keypoints[3][0] - keypoints[4][0])
-            ancho_estimado = dist_orejas * 2.2
-        # Método 2: Usar distancia oreja-nariz × 3 como proxy
-        elif 0 in keypoints and (3 in keypoints or 4 in keypoints):
-            oreja_idx = 3 if 3 in keypoints else 4
-            dist_nariz_oreja = abs(keypoints[0][0] - keypoints[oreja_idx][0])
-            ancho_estimado = dist_nariz_oreja * 3.0
-        # Método 3: Usar la cadera del mismo lado si está disponible
-        elif (hombro_visible_idx == 5 and 11 in keypoints):
-            # La distancia hombro-cadera da una referencia de escala
-            dist_torso = abs(keypoints[5][1] - keypoints[11][1])
-            ancho_estimado = dist_torso * 0.6  # Hombros ≈ 60% del largo del torso
-        elif (hombro_visible_idx == 6 and 12 in keypoints):
-            dist_torso = abs(keypoints[6][1] - keypoints[12][1])
-            ancho_estimado = dist_torso * 0.6
-
-        # Si no se pudo estimar, usar un valor por defecto basado en el frame
-        if ancho_estimado < 20:
-            ancho_estimado = ancho * 0.15  # ~15% del ancho del frame
-
-        # Para vista lateral, el hombro oculto está detrás (reducir separación)
-        # En vista lateral los hombros se ven más juntos
-        separacion = ancho_estimado * 0.3  # Solo 30% de la separación real
-
-        # Dirección de colocación: perpendicular al eje del torso visible
-        # (hombro→cadera del mismo lado), no siempre horizontal. Así el
-        # esqueleto dibujado acompaña la inclinación real del cuerpo en vez
-        # de quedar congelado en la misma Y. Es solo un ajuste visual: las
-        # mediciones ergonómicas en vista lateral ya ignoran este punto
-        # fabricado (ver evaluador_rula._angulos_lateral).
-        cadera_visible_idx = 11 if hombro_visible_idx == 5 else 12
-        if cadera_visible_idx in keypoints:
-            cv_ = keypoints[cadera_visible_idx]
-            eje_x, eje_y = hv[0] - cv_[0], hv[1] - cv_[1]
-            norma_eje = (eje_x ** 2 + eje_y ** 2) ** 0.5
-            if norma_eje > 1e-3:
-                dir_x, dir_y = eje_x / norma_eje, eje_y / norma_eje
-            else:
-                dir_x, dir_y = 0.0, -1.0
-        else:
-            dir_x, dir_y = 0.0, -1.0  # sin cadera visible: torso vertical por defecto
-
-        # Perpendicular al eje del torso, hacia el lado del hombro faltante
-        perp_x, perp_y = -dir_y, dir_x
-        signo = 1 if hombro_visible_idx == 5 else -1  # falta el derecho => +; falta el izq => -
-        hombro_x = hv[0] + signo * perp_x * separacion
-        hombro_y = hv[1] + signo * perp_y * separacion
-
-        # Clamp dentro del frame
-        hombro_x = max(5, min(hombro_x, ancho - 5))
-        hombro_y = max(5, min(hombro_y, alto - 5))
-
-        keypoints[hombro_faltante_idx] = (float(hombro_x), float(hombro_y), CONF_ESTIMADA)
-
-        return keypoints
-
-    def _estimar_caderas(self, keypoints, frame_shape):
-        """
-        Estima posición de caderas cuando no son visibles en el frame.
-        
-        Usa la posición de los hombros y proporciones antropométricas para
-        estimar dónde estarían las caderas. Se asigna una confianza baja
-        para que el sistema sepa que son estimaciones.
-        
-        Args:
-            keypoints: dict {idx: (x, y, conf)} con keypoints detectados.
-            frame_shape: tuple (alto, ancho, canales) del frame.
-            
-        Returns:
-            dict actualizado con caderas estimadas (si faltaban).
-        """
-        alto, ancho = frame_shape[:2]
-
-        if 5 not in keypoints or 6 not in keypoints:
-            return keypoints
-
-        hombro_izq = keypoints[5]
-        hombro_der = keypoints[6]
-
-        # Calcular ancho de hombros en píxeles
-        ancho_hombros = abs(hombro_izq[0] - hombro_der[0])
-
-        if ancho_hombros < 5:
-            # Vista muy lateral: hombros casi superpuestos
-            # Usar la altura como referencia para el largo del torso
-            if 0 in keypoints:  # Usar nariz como referencia de escala
-                dist_cabeza_hombro = abs(keypoints[0][1] - hombro_izq[1])
-                largo_torso = dist_cabeza_hombro * 2.0
-            else:
-                largo_torso = alto * 0.25  # Estimación por defecto
-        else:
-            # Estimar longitud del torso en píxeles
-            largo_torso = ancho_hombros * self.RATIO_TORSO_HOMBROS
-
-        # Estimar posición de caderas: debajo de los hombros
-        centro_hombros_x = (hombro_izq[0] + hombro_der[0]) / 2
-        centro_hombros_y = (hombro_izq[1] + hombro_der[1]) / 2
-
-        # Para vista lateral, las caderas están casi alineadas con los hombros
-        ancho_caderas = max(ancho_hombros * 0.80, 10)
-
-        cadera_y = min(centro_hombros_y + largo_torso, alto - 5)
-        cadera_izq_x = centro_hombros_x - ancho_caderas / 2
-        cadera_der_x = centro_hombros_x + ancho_caderas / 2
-
-        if 11 not in keypoints:
-            keypoints[11] = (float(cadera_izq_x), float(cadera_y), CONF_ESTIMADA)
-
-        if 12 not in keypoints:
-            keypoints[12] = (float(cadera_der_x), float(cadera_y), CONF_ESTIMADA)
-
-        return keypoints
+        return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
 
     def detectar(self, frame):
         """
-        Detecta keypoints 2D de la persona principal en el frame.
-
-        Funciona con cámara frontal, lateral o en ángulo.
-        Solo requiere al menos 1 hombro visible para iniciar la detección.
+        Detecta la pose de la persona principal en el frame.
 
         Args:
-            frame: Imagen BGR de OpenCV (numpy array HxWx3).
+            frame: imagen BGR de OpenCV (numpy HxWx3).
 
         Returns:
-            dict {idx: (x, y, confianza)} con los keypoints detectados,
-            o None si no se detecta una persona con suficientes puntos.
+            tuple (keypoints_2d, keypoints_world):
+                keypoints_2d:    dict {coco_idx: (x_px, y_px, visibilidad)}
+                keypoints_world: dict {coco_idx: np.array([X, Y, Z]) en cm}
+            Ambos None si no se detecta una persona con al menos un hombro.
         """
-        # Preprocesar frame para mejorar detección en baja luz
-        frame_procesado = self._preprocesar_frame(frame)
+        frame_proc = self._preprocesar_frame(frame)
 
-        # Inferencia YOLOv8-Pose (verbose=False para no llenar la consola)
-        resultados = self.modelo(
-            frame_procesado, conf=self.confianza, imgsz=YOLO_IMGSZ, verbose=False
-        )
+        # MediaPipe Tasks espera un mp.Image en RGB
+        rgb = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        if len(resultados) == 0:
-            self._frames_perdidos += 1
-            if self._frames_perdidos >= self._MAX_FRAMES_PERDIDOS:
-                self._centroide_rastreado = None
-            return None
+        # El modo VIDEO exige timestamps estrictamente crecientes (ms)
+        self._ts_ms += 33
+        resultado = self.landmarker.detect_for_video(mp_image, self._ts_ms)
 
-        # Seleccionar la persona principal con tracking por centroide
-        # kps.data shape: (num_personas, 17, 3) donde 3 = (x, y, conf)
-        persona_idx = self._seleccionar_persona(resultados)
-        if persona_idx is None:
-            return None
+        if not resultado.pose_landmarks:
+            return None, None
 
-        kps = resultados[0].keypoints
-        persona = kps.data[persona_idx].cpu().numpy()
+        alto, ancho = frame.shape[:2]
+        lm2d = resultado.pose_landmarks[0]
+        lmw = (resultado.pose_world_landmarks[0]
+               if resultado.pose_world_landmarks else None)
 
-        keypoints = {}
-        for idx in range(17):
-            x, y, conf = persona[idx]
-            if conf >= KEYPOINT_CONFIANZA_MIN:
-                keypoints[idx] = (float(x), float(y), float(conf))
+        keypoints_2d = {}
+        keypoints_world = {}
 
-        # Punto mínimo: al menos 1 hombro visible
-        # (permite detección desde cualquier ángulo de cámara)
-        tiene_hombro = 5 in keypoints or 6 in keypoints
-        if not tiene_hombro:
-            return None
+        for mp_idx, coco_idx in _MP_A_COCO.items():
+            p = lm2d[mp_idx]
+            # Filtrar por PRESENCIA (¿está el punto en el encuadre?), no por
+            # visibilidad: así se conservan puntos ocluidos pero bien inferidos
+            # (caderas tras el escritorio) que son clave para medir el tronco.
+            if float(p.presence) < self.presence_min:
+                continue
+            vis = float(p.visibility)  # se guarda para que el evaluador clasifique la vista
 
-        # Si falta un hombro, estimarlo (vista lateral)
-        if 5 not in keypoints or 6 not in keypoints:
-            keypoints = self._estimar_hombro_faltante(keypoints, frame.shape)
+            # 2D en píxeles del frame
+            px = float(p.x * ancho)
+            py = float(p.y * alto)
+            keypoints_2d[coco_idx] = (px, py, vis)
 
-        # Si faltan caderas, estimarlas desde los hombros
-        if 11 not in keypoints or 12 not in keypoints:
-            keypoints = self._estimar_caderas(keypoints, frame.shape)
+            # 3D real (world landmark) en cm: X derecha, Y abajo, Z profundidad
+            if lmw is not None:
+                w = lmw[mp_idx]
+                keypoints_world[coco_idx] = np.array([
+                    w.x * _M_A_CM,
+                    w.y * _M_A_CM,
+                    w.z * _M_A_CM,
+                ])
 
-        return keypoints
+        # Punto mínimo: al menos un hombro visible (igual que el sistema anterior)
+        if 5 not in keypoints_2d and 6 not in keypoints_2d:
+            return None, None
+
+        if not keypoints_world:
+            keypoints_world = None
+
+        return keypoints_2d, keypoints_world
 
     def obtener_bbox(self, frame):
         """
-        Obtiene el bounding box de la persona detectada.
+        Bounding box aproximado de la persona a partir de los landmarks 2D.
 
         Returns:
-            tuple (x1, y1, x2, y2) o None
+            tuple (x1, y1, x2, y2) o None.
         """
-        frame_procesado = self._preprocesar_frame(frame)
-        resultados = self.modelo(
-            frame_procesado, conf=self.confianza, imgsz=YOLO_IMGSZ, verbose=False
-        )
-
-        if len(resultados) == 0 or resultados[0].boxes is None:
+        keypoints_2d, _ = self.detectar(frame)
+        if not keypoints_2d:
             return None
 
-        boxes = resultados[0].boxes
-        if boxes.data.shape[0] == 0:
-            return None
+        xs = [p[0] for p in keypoints_2d.values()]
+        ys = [p[1] for p in keypoints_2d.values()]
+        return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
 
-        box = boxes.xyxy[0].cpu().numpy()
-        return tuple(box.astype(int))
+    def cerrar(self):
+        """Libera los recursos de MediaPipe."""
+        self.landmarker.close()

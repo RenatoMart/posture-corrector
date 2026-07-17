@@ -1,9 +1,9 @@
 """
 Postura.py — Sistema de Análisis de Postura Ergonómica en Tiempo Real.
 
-Arquitectura Híbrida de 3 Fases:
-    Fase 1: Extracción 2D ultrarrápida (YOLOv8-Pose)
-    Fase 2: Elevación geométrica a 3D (proporciones antropométricas)
+Arquitectura de 3 Fases:
+    Fase 1: Extracción de pose con MediaPipe Pose (33 landmarks, 3D real)
+    Fase 2: Ensamblado de la pose 3D (puntos virtuales + suavizado)
     Fase 3: Evaluación ergonómica RULA (Rapid Upper Limb Assessment)
 
 Uso:
@@ -16,6 +16,8 @@ Uso:
     - Alarma sonora si se detecta riesgo sostenido
 """
 
+import argparse
+
 import cv2
 import winsound
 import threading
@@ -23,10 +25,12 @@ from detector_2d import Detector2D
 from elevador_3d import Elevador3D
 from evaluador_rula import EvaluadorRULA
 from visualizador import Visualizador
+from filtro_oneeuro import EstabilizadorPose
 from config import (
-    CAMERA_INDEX, ALTURA_SUJETO_CM,
+    CAMERA_INDEX, ALTURA_SUJETO_CM, MP_USAR_GPU,
     ALARMA_FRECUENCIA_HZ, ALARMA_DURACION_MS,
     UMBRAL_FRAMES_ALARMA, UMBRAL_FRAMES_LIBERA, UMBRAL_RULA_ALARMA,
+    SUAVIZADO_ONEEURO, ONEEURO_2D_MIN_CUTOFF, ONEEURO_2D_BETA, ONEEURO_2D_D_CUTOFF,
 )
 
 
@@ -37,20 +41,38 @@ def emitir_alarma_async():
     threading.Thread(target=_beep, daemon=True).start()
 
 
+def _parsear_args():
+    """Lee las opciones de línea de comandos."""
+    p = argparse.ArgumentParser(
+        description="Análisis de postura ergonómica (RULA) en tiempo real.")
+    grupo = p.add_mutually_exclusive_group()
+    grupo.add_argument(
+        '--gpu', dest='usar_gpu', action='store_true', default=None,
+        help="Forzar el uso de GPU (si el build de MediaPipe lo soporta; en "
+             "Windows suele caer a CPU automáticamente).")
+    grupo.add_argument(
+        '--cpu', dest='usar_gpu', action='store_false',
+        help="Forzar el uso de CPU.")
+    return p.parse_args()
+
+
 def main():
+    args = _parsear_args()
+    usar_gpu = MP_USAR_GPU if args.usar_gpu is None else args.usar_gpu
     # ==========================================================================
     # INICIALIZACIÓN DE MÓDULOS
     # ==========================================================================
     print("=" * 60)
     print("  SISTEMA DE ANÁLISIS DE POSTURA ERGONÓMICA")
-    print("  Arquitectura Híbrida: YOLO-Pose → 3D Lifting → RULA")
+    print("  Arquitectura: MediaPipe Pose → 3D real → RULA")
     print("=" * 60)
     print()
 
-    print("[1/4] Inicializando detector 2D (YOLOv8-Pose)...")
-    detector = Detector2D()
+    print("[1/4] Inicializando detector de pose (MediaPipe Pose)...")
+    detector = Detector2D(usar_gpu=usar_gpu)
+    print(f"      >>> PROCESANDO CON: {detector.delegado} <<<")
 
-    print("[2/4] Inicializando elevador 3D (geometría antropométrica)...")
+    print("[2/4] Inicializando ensamblador 3D...")
     elevador = Elevador3D(altura_sujeto_cm=ALTURA_SUJETO_CM)
 
     print("[3/4] Inicializando evaluador RULA...")
@@ -59,12 +81,23 @@ def main():
     print("[4/4] Inicializando visualizador...")
     visualizador = Visualizador()
 
+    # Estabilizador anti-jitter de la pose 2D (los puntos que se dibujan en
+    # pantalla). Solo suaviza x,y (n_coords=2); la visibilidad se conserva.
+    estabilizador_2d = (
+        EstabilizadorPose(
+            min_cutoff=ONEEURO_2D_MIN_CUTOFF,
+            beta=ONEEURO_2D_BETA,
+            d_cutoff=ONEEURO_2D_D_CUTOFF,
+            n_coords=2,
+        ) if SUAVIZADO_ONEEURO else None
+    )
+
     # ==========================================================================
     # ACTIVAR CÁMARA
     # ==========================================================================
     print()
     print(f"[Cámara] Abriendo cámara (índice {CAMERA_INDEX})...")
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = cv2.VideoCapture(1)
 
     if not cap.isOpened():
         print("[ERROR] No se pudo acceder a la cámara.")
@@ -103,16 +136,20 @@ def main():
         frame = cv2.flip(frame, 1)
 
         # ==================================================================
-        # FASE 1: Extracción 2D (YOLOv8-Pose)
+        # FASE 1: Extracción de pose (MediaPipe Pose) — 2D + 3D real
         # ==================================================================
-        keypoints_2d = detector.detectar(frame)
+        keypoints_2d, keypoints_world = detector.detectar(frame)
+
+        # Anti-jitter de los puntos 2D antes de usarlos (dibujo, silueta, vista)
+        if estabilizador_2d is not None and keypoints_2d is not None:
+            keypoints_2d = estabilizador_2d(keypoints_2d)
 
         # ==================================================================
-        # FASE 2: Elevación a 3D
+        # FASE 2: Ensamblado de la pose 3D
         # ==================================================================
         keypoints_3d = None
-        if keypoints_2d is not None:
-            keypoints_3d = elevador.elevar(keypoints_2d, frame.shape)
+        if keypoints_world is not None:
+            keypoints_3d = elevador.elevar(keypoints_world)
 
         # ==================================================================
         # FASE 3: Evaluación RULA
@@ -161,6 +198,8 @@ def main():
             # tanto el escorzo frontal como la silueta lateral del tronco.
             elevador.recalibrar()
             evaluador.recalibrar()
+            if estabilizador_2d is not None:
+                estabilizador_2d.reset()
             print("[Calibracion] Linea base de postura erguida reiniciada.")
 
     # ==========================================================================
@@ -168,6 +207,7 @@ def main():
     # ==========================================================================
     cap.release()
     cv2.destroyAllWindows()
+    detector.cerrar()
     print()
     print("[OK] Sistema cerrado correctamente.")
 

@@ -92,17 +92,49 @@ CAMERA_FOV_GRADOS = 60         # Campo de visión estimado (grados)
 ALTURA_SUJETO_CM = 170          # Altura del sujeto en centímetros
 
 # =============================================================================
-# PARÁMETROS DE DETECCIÓN
+# PARÁMETROS DE DETECCIÓN — MediaPipe Pose (BlazePose)
 # =============================================================================
-YOLO_MODELO = 'yolov8n-pose.pt'  # Modelo nano (más rápido, 6.4MB)
-                                 # Alternativa: 'yolov8s-pose.pt' (~23MB) —
-                                 # keypoints notablemente más precisos a costa
-                                 # de ~2-3x menos FPS en CPU. Se descarga solo.
-YOLO_IMGSZ = 640                 # Resolución de inferencia (múltiplo de 32).
-                                 # Subir a 960 mejora keypoints lejanos (más lento).
-YOLO_CONFIANZA = 0.5             # Confianza mínima de detección de persona
-KEYPOINT_CONFIANZA_MIN = 0.3     # Confianza mínima por keypoint individual
-CONF_FABRICADO = 0.26            # Confianza <= a esto = keypoint fabricado (no detectado por YOLO)
+# MediaPipe entrega 33 landmarks CON profundidad real (world landmarks en metros,
+# origen en el centro de las caderas). Eso resuelve la limitación central del
+# sistema anterior: la postura sagital (encorvarse / cabeza adelantada) ahora se
+# mide en 3D real en CUALQUIER vista, sin estimar profundidad por escorzo.
+# Los 33 landmarks se mapean a los 17 índices COCO (ver detector_2d._MP_A_COCO)
+# para que el resto del pipeline (evaluador, visualizador) siga igual.
+MP_MODEL_COMPLEXITY = 1          # 0 = lite (rápido) / 1 = full (equilibrado) / 2 = heavy (más preciso).
+                                 # En CPU (MediaPipe en Windows es SIEMPRE CPU, ver MP_USAR_GPU),
+                                 # 'full' da el mejor equilibrio precisión/FPS. 'heavy' es hasta ~3x
+                                 # más lento y en un portátil ahoga los FPS. Si aún vas justo, baja a 0
+                                 # (lite); si te sobra CPU y quieres máxima precisión, sube a 2 (heavy).
+MP_USAR_GPU = False              # Intentar acelerar por GPU (delegado GPU de MediaPipe).
+                                 # OJO: la rueda de MediaPipe para Windows en Python viene compilada
+                                 # SOLO para CPU (GPU disabled in build flags), así que en Windows esto
+                                 # cae automáticamente a CPU. Útil solo en Linux o en un build con GPU.
+                                 # Se puede forzar por línea de comandos: python Postura.py --gpu
+MP_MIN_DET_CONF = 0.5            # Confianza mínima para detectar a la persona
+MP_MIN_TRACK_CONF = 0.5          # Confianza mínima para seguir a la persona entre frames
+MP_MIN_PRESENCE_CONF = 0.5       # Confianza mínima de presencia de la pose
+MP_PRESENCE_MIN = 0.5            # Presencia mínima por landmark para usarlo (0-1). Se filtra por
+                                 # PRESENCIA (¿está el punto en el encuadre?) y NO por visibilidad,
+                                 # para conservar puntos ocluidos pero bien inferidos —p.ej. las
+                                 # caderas tapadas por el escritorio—, que son clave para medir el
+                                 # tronco al estar sentado de frente. La visibilidad se guarda igual
+                                 # y el evaluador la usa para clasificar la vista (frente/lado).
+
+# Modelos de MediaPipe Tasks (archivo .task, se descarga solo la primera vez).
+# Cada complejidad usa un bundle distinto (lite / full / heavy).
+MP_MODELOS = {
+    0: ('pose_landmarker_lite.task',
+        'https://storage.googleapis.com/mediapipe-models/pose_landmarker/'
+        'pose_landmarker_lite/float16/latest/pose_landmarker_lite.task'),
+    1: ('pose_landmarker_full.task',
+        'https://storage.googleapis.com/mediapipe-models/pose_landmarker/'
+        'pose_landmarker_full/float16/latest/pose_landmarker_full.task'),
+    2: ('pose_landmarker_heavy.task',
+        'https://storage.googleapis.com/mediapipe-models/pose_landmarker/'
+        'pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task'),
+}
+CONF_FABRICADO = 0.26            # Visibilidad <= a esto = landmark poco fiable (oculto).
+                                 # Usado por el evaluador para clasificar la vista de cámara.
 
 # =============================================================================
 # CLASIFICACIÓN DE VISTA DE CÁMARA (frontal / ángulo / lateral)
@@ -196,6 +228,27 @@ UMBRAL_RULA_ALARMA = 5          # Score RULA mínimo para considerar riesgo
 # PARÁMETROS DE SUAVIZADO TEMPORAL
 # =============================================================================
 SUAVIZADO_ALPHA = 0.4            # Factor de suavizado exponencial (0-1, mayor = más reactivo)
+                                 # Solo se usa si SUAVIZADO_ONEEURO = False.
+
+# --- Filtro One-Euro (anti-jitter) -------------------------------------------
+# Suavizado adaptativo: quita el temblor de los landmarks cuando estás quieto y
+# NO añade retraso al moverte (a diferencia de la EMA de alpha fijo de arriba).
+# Ver filtro_oneeuro.py. Sube beta si notas "lag" al moverte; baja min_cutoff
+# (y/o beta) si aún tiemblan los puntos estando quieto.
+SUAVIZADO_ONEEURO = True         # True = One-Euro (recomendado) / False = EMA clásica
+
+# Pose 3D (world landmarks en cm) → ángulos RULA y HUD.
+# Defaults calibrados: ~65% menos temblor en reposo con ~0.5 cm de retraso al
+# moverse (imperceptible). Sube beta para menos lag; baja min_cutoff/beta para
+# aún menos temblor.
+ONEEURO_3D_MIN_CUTOFF = 0.8      # Hz. Menor = más estable en reposo
+ONEEURO_3D_BETA = 0.05           # Mayor = reacciona antes al movimiento
+ONEEURO_3D_D_CUTOFF = 1.0        # Hz. Cutoff de la derivada (dejar en 1.0)
+
+# Pose 2D (píxeles) → esqueleto dibujado en pantalla (escala distinta al 3D)
+ONEEURO_2D_MIN_CUTOFF = 1.0      # Hz
+ONEEURO_2D_BETA = 0.03           # px: velocidades típicas de decenas–cientos px/s
+ONEEURO_2D_D_CUTOFF = 1.0        # Hz
 
 # =============================================================================
 # COLORES BGR PARA VISUALIZACIÓN

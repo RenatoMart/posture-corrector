@@ -1,0 +1,9 @@
+# Dependencias del sistema de análisis de postura (RULA con MediaPipe Pose).
+# Instalar con:  pip install -r requirements.txt
+#
+# MediaPipe arrastra automáticamente numpy, opencv-contrib-python, matplotlib,
+# etc. Se fijan las versiones probadas en este proyecto (Python 3.12, jul-2026).
+
+mediapipe==0.10.35
+opencv-python==5.0.0.93
+numpy==2.5.1
