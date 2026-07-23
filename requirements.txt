@@ -7,3 +7,9 @@
 mediapipe==0.10.35
 opencv-python==5.0.0.93
 numpy==2.5.1
+
+# Detector de encorvamiento por Machine Learning (Random Forest).
+# recolectar_datos.py / entrenar_modelo.py / clasificador_postura.py
+scikit-learn==1.9.0
+pandas==3.0.3
+joblib==1.5.3

@@ -56,7 +56,8 @@ except Exception:
 
 from config import (
     MP_MODEL_COMPLEXITY, MP_MODELOS, MP_USAR_GPU,
-    MP_MIN_DET_CONF, MP_MIN_TRACK_CONF, MP_MIN_PRESENCE_CONF, MP_PRESENCE_MIN,
+    MP_MIN_DET_CONF, MP_MIN_TRACK_CONF, MP_MIN_PRESENCE_CONF,
+    MP_PRESENCE_MIN, MP_PRESENCE_MIN_3D,
     PREPROCESAMIENTO_ACTIVO, CLAHE_CLIP_LIMIT, CLAHE_TILE_SIZE,
 )
 
@@ -148,7 +149,8 @@ class Detector2D:
         self.landmarker, self.delegado = self._crear_landmarker(
             ruta_modelo, confianza, usar_gpu
         )
-        self.presence_min = MP_PRESENCE_MIN
+        self.presence_min = MP_PRESENCE_MIN          # filtro para los puntos 2D (dibujo/vista)
+        self.presence_min_3d = MP_PRESENCE_MIN_3D    # filtro (bajo) para los world landmarks 3D
 
         # Timestamp monótono creciente (ms) que exige el modo VIDEO
         self._ts_ms = 0
@@ -276,20 +278,24 @@ class Detector2D:
 
         for mp_idx, coco_idx in _MP_A_COCO.items():
             p = lm2d[mp_idx]
-            # Filtrar por PRESENCIA (¿está el punto en el encuadre?), no por
-            # visibilidad: así se conservan puntos ocluidos pero bien inferidos
-            # (caderas tras el escritorio) que son clave para medir el tronco.
-            if float(p.presence) < self.presence_min:
-                continue
+            presencia = float(p.presence)
             vis = float(p.visibility)  # se guarda para que el evaluador clasifique la vista
 
-            # 2D en píxeles del frame
-            px = float(p.x * ancho)
-            py = float(p.y * alto)
-            keypoints_2d[coco_idx] = (px, py, vis)
+            # --- Punto 2D (para dibujar el esqueleto y clasificar la vista) ---
+            # Se filtra por PRESENCIA: no tiene sentido dibujar un punto que está
+            # FUERA del encuadre (quedaría en una posición sin significado).
+            if presencia >= self.presence_min:
+                px = float(p.x * ancho)
+                py = float(p.y * alto)
+                keypoints_2d[coco_idx] = (px, py, vis)
 
-            # 3D real (world landmark) en cm: X derecha, Y abajo, Z profundidad
-            if lmw is not None:
+            # --- Punto 3D (world landmark) en cm: X derecha, Y abajo, Z prof. ---
+            # MediaPipe estima el ESQUELETO 3D COMPLETO aunque el punto esté fuera
+            # de cuadro (lo infiere por proporciones humanas). Por eso el 3D usa un
+            # umbral MUCHO más bajo: así se conservan las caderas/tronco inferidos
+            # cuando la persona está muy cerca y solo se le ve cabeza y hombros,
+            # y se puede seguir midiendo la postura (RULA + clasificador ML).
+            if lmw is not None and presencia >= self.presence_min_3d:
                 w = lmw[mp_idx]
                 keypoints_world[coco_idx] = np.array([
                     w.x * _M_A_CM,

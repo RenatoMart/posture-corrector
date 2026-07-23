@@ -32,6 +32,10 @@ desktop.ini
 *.onnx
 *.pth
 
+# ---- Detector ML de encorvamiento (datos y modelo entrenado, se regeneran) ----
+datos_postura.csv
+modelo_postura.joblib
+
 # ---- Salidas / archivos generados ----
 resultado_ergonomico.mp4
 *.mp4

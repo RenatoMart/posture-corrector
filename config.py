@@ -113,12 +113,19 @@ MP_USAR_GPU = False              # Intentar acelerar por GPU (delegado GPU de Me
 MP_MIN_DET_CONF = 0.5            # Confianza mínima para detectar a la persona
 MP_MIN_TRACK_CONF = 0.5          # Confianza mínima para seguir a la persona entre frames
 MP_MIN_PRESENCE_CONF = 0.5       # Confianza mínima de presencia de la pose
-MP_PRESENCE_MIN = 0.5            # Presencia mínima por landmark para usarlo (0-1). Se filtra por
-                                 # PRESENCIA (¿está el punto en el encuadre?) y NO por visibilidad,
-                                 # para conservar puntos ocluidos pero bien inferidos —p.ej. las
-                                 # caderas tapadas por el escritorio—, que son clave para medir el
-                                 # tronco al estar sentado de frente. La visibilidad se guarda igual
-                                 # y el evaluador la usa para clasificar la vista (frente/lado).
+MP_PRESENCE_MIN = 0.5            # Presencia mínima por landmark para usarlo EN 2D (0-1). Se filtra
+                                 # por PRESENCIA (¿está el punto en el encuadre?) y NO por visibilidad.
+                                 # Afecta SOLO a los puntos 2D que se dibujan y a la clasificación de
+                                 # vista: no tiene sentido dibujar un punto que está fuera de cuadro.
+                                 # La visibilidad se guarda igual y el evaluador la usa para clasificar
+                                 # la vista (frente/lado).
+MP_PRESENCE_MIN_3D = 0.0        # Presencia mínima por landmark para usarlo EN 3D (world landmark).
+                                 # Se pone MUY bajo (0 = conservar todos) a propósito: MediaPipe estima
+                                 # el ESQUELETO 3D COMPLETO aunque un punto esté FUERA de cuadro (lo
+                                 # infiere por proporciones humanas). Conservar esos puntos inferidos
+                                 # permite medir el tronco/caderas cuando la persona está MUY CERCA de
+                                 # la cámara y solo se le ve cabeza, hombros y parte del torso. Súbelo
+                                 # (p.ej. 0.1-0.2) si notas ruido por inferencias malas.
 
 # Modelos de MediaPipe Tasks (archivo .task, se descarga solo la primera vez).
 # Cada complejidad usa un bundle distinto (lite / full / heavy).
