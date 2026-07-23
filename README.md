@@ -117,9 +117,12 @@ python Postura.py --cpu   # fuerza CPU
 > **⚠️ Sobre la GPU:** la rueda oficial de **MediaPipe para Windows en Python está compilada solo para CPU** (*GPU processing is disabled in build flags*). El flag `--gpu` intenta usar la GPU y, si el build no lo permite (tu caso en Windows), **cae automáticamente a CPU** avisándote por consola — nunca se queda sin funcionar. Habilitar GPU de verdad requeriría recompilar MediaPipe desde el código fuente (o correr en Linux). En Windows, la forma real de ganar velocidad es bajar `MP_MODEL_COMPLEXITY` (2→1→0). Nota: el delegado `XNNPACK` que ves al arrancar **ya es** una optimización de CPU (multinúcleo/SIMD).
 
 ### Controles durante la ejecución:
+Debajo del vídeo hay un **panel de control** (estilo `recolectar_datos.py`) que muestra los botones de vista, el estado del detector ML, la cámara activa y la leyenda de teclas, sin tapar la imagen.
+
 - **`Q`**: Salir del programa y cerrar la cámara.
 - **`C`**: Recalibrar. Siéntate erguido y púlsala: reinicia el suavizado de la pose y la línea base de la detección de encorvamiento lateral por silueta.
 - **`N`**: Cambiar a la siguiente cámara disponible (por ejemplo, alternar entre la webcam integrada y DroidCam). Si no hay otra, conserva la actual sin cerrarse.
+- **Selección de vista** — botones clicables **FRENTE / COSTADO / ANGULO / AUTO** en el panel, o teclas **`1`/`2`/`3`/`0`**. Fija la vista de cámara a mano cuando la detección automática no acierta; con **AUTO** (`0`) vuelve a detectarla sola. El botón activo se resalta en verde.
 
 ### Entrenar el detector de encorvamiento (ML) — opcional
 El detector ML aprende de tus propios datos. El ciclo es **iterativo y acumulativo**:
@@ -151,6 +154,7 @@ Puedes abrir el archivo `config.py` para adaptar el programa a tus necesidades. 
 - `MP_MODEL_COMPLEXITY`: `0` (lite, más rápido), `1` (full, equilibrado) o `2` (heavy, más preciso pero más lento en CPU). El modelo correspondiente se descarga solo.
 - `MP_PRESENCE_MIN`: Presencia mínima (0-1) para usar un landmark **en 2D** (dibujo y clasificación de vista). No se dibuja lo que está fuera de cuadro.
 - `MP_PRESENCE_MIN_3D`: Presencia mínima para usar un landmark **en 3D** (world landmark). Está en `0.0` a propósito (conservar los puntos inferidos) para poder medir el tronco/caderas cuando estás **muy cerca** de la cámara. Súbelo a `0.1`–`0.2` si notas ruido por inferencias malas en primer plano.
+- **Banda del score del cuello** (`CUELLO_NEUTRO_MIN` / `CUELLO_NEUTRO_MAX` / `CUELLO_EXTENSION_MARCADA` / `CUELLO_FLEXION_MODERADA`): el cuello se puntúa por una **banda neutra** (score 1 entre 15°–23°), con dos niveles a cada lado — mirar hacia arriba (por debajo de 15°, luego de 12°) y hacia abajo (por encima de 23°, luego de 32°). El ángulo neutro aparece "inflado" (~15-20°) porque se mide desde los hombros; ajusta la banda a tu neutro real mirando el ángulo en el HUD.
 - `ENCORVADO_ACTIVO`: Activa/desactiva la detección de encorvamiento lateral por silueta. Los parámetros `ENCORVADO_*` ajustan su sensibilidad: sube `ENCORVADO_RESIDUO_MAX` para ser más permisivo con fondos complejos, o baja `ENCORVADO_GANANCIA` si detecta encorvamiento de más.
 
 > **Umbral del detector ML:** el punto de disparo del clasificador de encorvamiento se ajusta en `Postura.py`, al instanciar `ClasificadorPostura(umbral_on=0.6, umbral_off=0.4)`. Sube `umbral_on` (p.ej. a `0.7`) para que sea más conservador y dé menos falsas alarmas.

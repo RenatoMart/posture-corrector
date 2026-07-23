@@ -166,6 +166,25 @@ VISTA_NARIZ_OFFSET_LATERAL = 0.60  # |x_nariz - x_centro_hombros| / alto_cabeza 
 VISTA_HISTERESIS_FRAMES = 4      # frames consistentes requeridos para cambiar de vista (anti-parpadeo)
 
 # =============================================================================
+# CUELLO — Banda neutra del score RULA (grados de flexión)
+# El cuello se mide desde el punto medio de los hombros (índice 17), no desde la
+# base real del cuello (vértebra C7). Como las orejas quedan naturalmente por
+# delante de esa línea, el ángulo NEUTRO de una persona sentada aparece
+# "inflado" (~15° de cerca, ~20° de lejos). Además el ángulo es una MAGNITUD: no
+# distingue mirar-abajo (flexión, el ángulo sube) de mirar-arriba (el ángulo baja
+# hacia la vertical). Por eso el score 1 no es un simple techo, sino una BANDA:
+#   - dentro de [MIN, MAX]           -> score 1 (postura neutra de oficina)
+#   - por DEBAJO de MIN              -> score 2 (cabeza hacia atrás / mirando arriba)
+#   - por ENCIMA de MAX              -> score 2 (flexión, mirando abajo)
+#   - por encima de FLEXION_MODERADA -> score 3 (flexión marcada / cabeza caída)
+# Ajusta la banda a tu neutro real (mira el ángulo en el HUD sentado derecho).
+# =============================================================================
+CUELLO_NEUTRO_MIN = 15           # límite inferior de la banda neutra (por debajo = mirar arriba)
+CUELLO_NEUTRO_MAX = 23           # límite superior de la banda neutra (por encima = mirar abajo)
+CUELLO_EXTENSION_MARCADA = 12    # lado ARRIBA: entre este valor y NEUTRO_MIN = score 2; por debajo = score 3
+CUELLO_FLEXION_MODERADA = 32     # lado ABAJO: hasta aquí score 2; más allá, score 3
+
+# =============================================================================
 # PREPROCESAMIENTO DE IMAGEN (mejora de iluminación)
 # =============================================================================
 PREPROCESAMIENTO_ACTIVO = True       # Activar/desactivar filtros de imagen

@@ -19,6 +19,8 @@ from config import (
     VISTA_ASIMETRIA_LATERAL, VISTA_SPREAD_FRONTAL, VISTA_SPREAD_LATERAL,
     VISTA_NARIZ_OFFSET_LATERAL, VISTA_HISTERESIS_FRAMES,
     ENCORVADO_ACTIVO,
+    CUELLO_NEUTRO_MIN, CUELLO_NEUTRO_MAX,
+    CUELLO_EXTENSION_MARCADA, CUELLO_FLEXION_MODERADA,
 )
 from detector_encorvamiento import AnalizadorSiluetaLateral
 
@@ -116,6 +118,38 @@ class EvaluadorRULA:
 
         # Analizador de encorvamiento por silueta (vista lateral con cadera oculta)
         self._analizador_silueta = AnalizadorSiluetaLateral() if ENCORVADO_ACTIVO else None
+
+        # Vista FORZADA a mano (None = detección automática). Se fija desde la
+        # interfaz de Postura.py (botones / teclas 1/2/3/0).
+        self.vista_manual = None
+
+    def set_vista_manual(self, vista):
+        """
+        Fija la vista de cámara a mano, saltándose la detección automática.
+
+        Args:
+            vista: 'frontal', 'lateral', 'angulo' o None (volver a automático).
+        """
+        if vista not in ('frontal', 'lateral', 'angulo', None):
+            return
+        self.vista_manual = vista
+
+    @staticmethod
+    def _lado_mas_fiable(keypoints_2d):
+        """
+        Lado del cuerpo con más confianza real (para forzar vista lateral/ángulo).
+
+        Al fijar la vista a mano necesitamos igualmente saber qué lado es el
+        visible/fiable; se elige por suma de confianza de los puntos reales.
+        """
+        if keypoints_2d is None:
+            return 'izq'
+        def _conf(indices):
+            return sum(keypoints_2d[i][2] for i in indices
+                       if i in keypoints_2d and keypoints_2d[i][2] > CONF_FABRICADO)
+        conf_izq = _conf([1, 3, 5, 11])   # ojo, oreja, hombro, cadera izq
+        conf_der = _conf([2, 4, 6, 12])   # ojo, oreja, hombro, cadera der
+        return 'izq' if conf_izq >= conf_der else 'der'
 
     def recalibrar(self):
         """Reinicia la línea base del detector de encorvamiento lateral (tecla 'C')."""
@@ -534,9 +568,9 @@ class EvaluadorRULA:
             if cabeza is not None:
                 vec_cuello = cabeza - cuello
                 # Proyección sagital: descartar X (giros/inclinación lateral de
-                # cabeza no son flexión). La profundidad Z proviene del escorzo
-                # calibrado (ver elevador_3d._elevar_sagital): cabeza adelantada
-                # => Z menor que los hombros => ángulo crece.
+                # cabeza no son flexión). La profundidad Z es la real de MediaPipe
+                # (world landmarks): cabeza adelantada => Z distinta de los hombros
+                # => el ángulo crece.
                 vec_sagital = np.array([0.0, vec_cuello[1], vec_cuello[2]])
                 angulo_cuello = self._angulo_entre_vectores(vec_sagital, vertical_arriba)
                 angulos['cuello_flexion'] = angulo_cuello
@@ -803,17 +837,31 @@ class EvaluadorRULA:
     def _score_cuello(angulo_flexion, en_extension=False):
         """Mapea ángulo del cuello a score RULA (1-6).
 
-        El límite del score 1 (12°) deja una pequeña tolerancia para el ruido
-        de la estimación de profundidad (cabeza adelantada) en vista frontal.
+        El score 1 es una BANDA neutra, no un techo: el ángulo del cuello es una
+        magnitud (distancia a la vertical) que NO distingue dirección. El neutro
+        de oficina cae ~15-20° (offset por medir desde los hombros, ver config).
+        - Mirar hacia ABAJO (flexión) sube el ángulo por encima de la banda.
+        - Mirar hacia ARRIBA acerca la cabeza a la vertical y BAJA el ángulo por
+          debajo de la banda (extensión leve / cabeza hacia atrás).
+        Ambas desviaciones de la banda neutra puntúan peor, en dos niveles cada
+        lado. Límites configurables en config.py: `CUELLO_NEUTRO_MIN/MAX` (banda
+        neutra), `CUELLO_EXTENSION_MARCADA` (lado arriba: 2→3) y
+        `CUELLO_FLEXION_MODERADA` (lado abajo: 2→3).
         """
         if en_extension:
-            return 4  # Cuello en extensión
-        elif angulo_flexion <= 12:
-            return 1  # 0° - 12° (neutral)
-        elif angulo_flexion <= 22:
-            return 2  # 12° - 22°
+            return 4  # Extensión franca (mirar claramente hacia arriba)
+        elif CUELLO_NEUTRO_MIN <= angulo_flexion <= CUELLO_NEUTRO_MAX:
+            return 1  # Banda neutra de oficina
+        elif angulo_flexion < CUELLO_NEUTRO_MIN:
+            # Lado ARRIBA (cabeza hacia atrás): dos niveles según cuánto se aleja.
+            if angulo_flexion >= CUELLO_EXTENSION_MARCADA:
+                return 2  # Leve (entre EXTENSION_MARCADA y NEUTRO_MIN)
+            else:
+                return 3  # Marcada (por debajo de EXTENSION_MARCADA)
+        elif angulo_flexion <= CUELLO_FLEXION_MODERADA:
+            return 2  # Flexión moderada (mirando abajo)
         else:
-            return 3  # > 22° flexión (cabeza caída o muy adelantada)
+            return 3  # Flexión marcada (cabeza caída o muy adelantada)
 
     @staticmethod
     def _score_tronco(angulo_flexion):
@@ -865,8 +913,13 @@ class EvaluadorRULA:
         if keypoints_3d is None:
             return None
 
-        # Detectar ángulo de cámara
-        vista, lado_fiable = self._detectar_vista(keypoints_2d)
+        # Ángulo de cámara: forzado a mano si el usuario lo fijó, si no automático.
+        if self.vista_manual is not None:
+            vista = self.vista_manual
+            lado_fiable = (None if vista == 'frontal'
+                           else self._lado_mas_fiable(keypoints_2d))
+        else:
+            vista, lado_fiable = self._detectar_vista(keypoints_2d)
 
         # En vista lateral, estimar el encorvamiento del tronco por silueta
         # (bordes) cuando la cadera no da información fiable.

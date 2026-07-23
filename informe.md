@@ -258,6 +258,14 @@ dependen de las caderas**:
 - Devuelve `(vista, lado_fiable)`. Esta función la reutiliza también
   `recolectar_datos.py` para etiquetar la vista de cada muestra.
 
+**Vista forzada a mano** (`set_vista_manual`): la detección automática puede fallar
+en posiciones límite. Por eso el evaluador acepta una vista **fijada por el
+usuario** desde la interfaz de `Postura.py` (botones clicables / teclas 1/2/3/0).
+Si `vista_manual` está definida, se salta `_detectar_vista` y usa esa; cuando la
+vista forzada es lateral/ángulo, el lado fiable se obtiene con `_lado_mas_fiable`
+(el lado con más confianza real). Con "AUTO" (None) vuelve a la detección
+automática.
+
 ### 6.2 Cálculo de ángulos — dos rutas de medición
 
 **Técnica base — ángulo entre vectores** (`_angulo_entre_vectores`): producto
@@ -283,6 +291,26 @@ Funciones `_score_brazo_superior`, `_score_antebrazo`, `_score_muneca`,
 `_score_cuello`, `_score_tronco`. Los **rangos están adaptados a oficina** (p.ej.
 brazo 0-40° = natural con teclado/mouse; antebrazo 45-120° = aceptable),
 reduciendo falsas alarmas frente a algoritmos genéricos estrictos.
+
+**Cuello — puntuación por BANDA (no por techo).** El cuello se mide desde el punto
+medio de los hombros (índice 17), no desde la base real del cuello (C7). Como las
+orejas quedan naturalmente por delante de esa línea, el ángulo **neutro** aparece
+inflado (~15° de cerca, ~20° de lejos), y además es una **magnitud** que no
+distingue mirar-abajo (el ángulo sube) de mirar-arriba (el ángulo baja hacia la
+vertical). Por eso `_score_cuello` no usa un simple umbral, sino una **banda
+neutra con dos niveles a cada lado**, toda configurable en `config.py`:
+
+| Ángulo | Score | Situación |
+|---|---|---|
+| < `CUELLO_EXTENSION_MARCADA` (12°) | 3 | Cabeza claramente hacia atrás / mirando arriba |
+| 12° – `CUELLO_NEUTRO_MIN` (15°) | 2 | Empieza a echar la cabeza atrás |
+| `CUELLO_NEUTRO_MIN`–`CUELLO_NEUTRO_MAX` (15°–23°) | **1** | **Banda neutra de oficina** |
+| 23° – `CUELLO_FLEXION_MODERADA` (32°) | 2 | Flexión moderada (mirando abajo) |
+| > 32° | 3 | Cabeza caída / muy adelantada |
+| (extensión franca, nariz sobre los ojos) | 4 | Mirar claramente hacia arriba |
+
+Ajustar la banda a tu neutro real (mirando el ángulo en el HUD) es la forma de
+calibrar la sensibilidad del cuello sin tocar código.
 
 ### 6.4 Tablas RULA y score final
 
@@ -487,14 +515,28 @@ exactamente estas tablas por consola.
    - **Control de alarma con histéresis**: en riesgo (`score >= UMBRAL_RULA_ALARMA`)
      durante `UMBRAL_FRAMES_ALARMA` frames → dispara `emitir_alarma_async()`; se
      libera solo tras `UMBRAL_FRAMES_LIBERA` frames buenos seguidos.
-   - **Visualización**: `visualizador.dibujar(...)`, más el **banner ML**
-     (`ML: ENCORVADO / erguido` con su probabilidad) y el **indicador de cámara**
-     activa (`CAM n`).
+   - **Visualización**: `visualizador.dibujar(...)` sobre el vídeo, y luego un
+     **panel de control DEBAJO** del vídeo (`cv2.vconcat`, ver más abajo), para que
+     nada tape la imagen.
    - **Teclas**: `Q` sale; `C` recalibra (elevador + evaluador + clasificador +
      estabilizador); **`N` cambia a la siguiente cámara** disponible **sin tocar la
      activa** (prueba solo otros índices y, si ninguno funciona, conserva la
-     actual — nunca mata el programa).
+     actual — nunca mata el programa); **`1`/`2`/`3`/`0`** fijan la vista a mano
+     (Frente / Costado / Ángulo / Automático).
 4. **Limpieza**: `cap.release()` + `cv2.destroyAllWindows()` + `detector.cerrar()`.
+
+**Panel de control e interfaz** (`_dibujar_panel_control`): en vez de superponer
+texto y botones sobre el vídeo (que se solapaban con el HUD), se compone un
+**lienzo = vídeo + panel negro inferior** (estilo `recolectar_datos.py`). El panel
+contiene, siempre visible y sin tapar la imagen:
+- **Botones clicables de VISTA** — FRENTE / COSTADO / ÁNGULO / AUTO. Un
+  `cv2.setMouseCallback` sobre la ventana (en modo **AUTOSIZE**, para que las
+  coordenadas del ratón coincidan 1:1 con la imagen) detecta el click contra los
+  rectángulos de los botones y llama a `evaluador.set_vista_manual(...)`. El botón
+  activo se resalta en verde. Las teclas `1/2/3/0` hacen lo mismo.
+- **Estado del detector ML** (`ML: erguido / ENCORVADO` con su probabilidad) y el
+  **índice de cámara** activa.
+- **Leyenda de teclas**.
 
 **Alarma no bloqueante** (`emitir_alarma_async`): `winsound.Beep` se lanza en un
 `threading.Thread(daemon=True)` para no congelar el vídeo.
@@ -515,8 +557,9 @@ Clase **`Visualizador`**. Dibuja sobre el frame (in-place) en capas:
 - **Indicador de vista** (`_dibujar_vista`): muestra FRENTE / LADO / ANGULO.
 - **FPS** (`_dibujar_fps`): media móvil sobre varias muestras.
 
-> El **banner ML** y el **indicador de cámara** se dibujan aparte, directamente en
-> `Postura.py`, para no acoplar el visualizador RULA con el detector ML.
+> El **panel de control inferior** (botones de vista, estado ML, cámara y leyenda)
+> se dibuja aparte en `Postura.py` (`_dibujar_panel_control`), para no acoplar el
+> visualizador RULA con el detector ML ni con la interfaz de control.
 
 ---
 
@@ -532,6 +575,7 @@ Agrupa todos los parámetros ajustables. Bloques principales:
 | Filtrado de landmarks | `MP_PRESENCE_MIN` (2D, =0.5) y **`MP_PRESENCE_MIN_3D`** (3D, =0.0 → conservar puntos inferidos para el primer plano) |
 | Preprocesamiento | `PREPROCESAMIENTO_ACTIVO`, parámetros CLAHE |
 | Clasificación de vista | Umbrales de asimetría, spread, offset de nariz, histéresis |
+| Cuello (banda de score) | `CUELLO_NEUTRO_MIN/MAX`, `CUELLO_EXTENSION_MARCADA`, `CUELLO_FLEXION_MODERADA` (§6.3) |
 | Encorvamiento lateral | Parámetros Canny, ROI, calibración, ganancia (§7) |
 | Suavizado | `SUAVIZADO_ALPHA` (EMA) y `SUAVIZADO_ONEEURO` + `ONEEURO_2D_*` / `ONEEURO_3D_*` |
 | Alarma | Frecuencia, duración, umbrales de frames y de RULA |

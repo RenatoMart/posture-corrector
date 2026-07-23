@@ -19,6 +19,7 @@ Uso:
 import argparse
 
 import cv2
+import numpy as np
 import winsound
 import threading
 from detector_2d import Detector2D
@@ -46,6 +47,8 @@ def emitir_alarma_async():
 # (evita que OpenCV se quede "pegado" a una cámara virtual como DroidCam).
 _CAM_BACKEND = cv2.CAP_DSHOW
 _MAX_CAMARAS = 6   # cuántos índices sondear al buscar/cambiar de cámara
+
+WINDOW = 'Analisis de Postura Ergonomica - RULA'   # título de la ventana
 
 
 def _abrir_camara(indice):
@@ -77,6 +80,76 @@ def _listar_camaras():
             disponibles.append(idx)
         cap.release()
     return disponibles
+
+
+PANEL_ALTURA = 118   # alto del panel de control debajo del vídeo
+
+
+def _dibujar_panel_control(lienzo, y0, vista_manual, ml_postura, indice_camara):
+    """
+    Dibuja el panel de control DEBAJO del vídeo (no encima), estilo recolectar.
+
+    Así los botones, el estado ML y la leyenda de teclas siempre se ven completos
+    y no tapan la imagen de la cámara.
+
+    Args:
+        lienzo: imagen compuesta (vídeo + panel) sobre la que dibujar (in-place).
+        y0: coordenada Y donde empieza el panel (= alto del vídeo).
+        vista_manual: vista fijada a mano o None (automático). Resalta el activo.
+        ml_postura: dict del clasificador ML o None.
+        indice_camara: índice de la cámara activa.
+
+    Returns:
+        Lista de rectángulos [(x1, y1, x2, y2, vista), ...] EN COORDENADAS DEL
+        LIENZO, para que el callback de ratón detecte los clicks en los botones.
+    """
+    w = lienzo.shape[1]
+    cv2.line(lienzo, (0, y0), (w, y0), (70, 70, 70), 1)
+
+    # --- Fila de botones de VISTA (clicables) ---
+    cv2.putText(lienzo, "VISTA:", (12, y0 + 32), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (220, 220, 220), 1, cv2.LINE_AA)
+    opciones = [('FRENTE', 'frontal'), ('COSTADO', 'lateral'),
+                ('ANGULO', 'angulo'), ('AUTO', None)]
+    bx, by1, bw, bh, gap = 92, y0 + 12, 118, 30, 8
+    rects = []
+    for etiqueta, vista in opciones:
+        bx2, by2 = bx + bw, by1 + bh
+        activo = (vista_manual == vista)
+        if activo:
+            cv2.rectangle(lienzo, (bx, by1), (bx2, by2), (0, 170, 0), -1)
+            cv2.rectangle(lienzo, (bx, by1), (bx2, by2), (0, 255, 0), 2)
+            color_txt = (0, 0, 0)
+        else:
+            cv2.rectangle(lienzo, (bx, by1), (bx2, by2), (55, 55, 55), -1)
+            cv2.rectangle(lienzo, (bx, by1), (bx2, by2), (130, 130, 130), 1)
+            color_txt = (235, 235, 235)
+        (tw, th), _ = cv2.getTextSize(etiqueta, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.putText(lienzo, etiqueta, (bx + (bw - tw) // 2, by1 + (bh + th) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_txt, 1, cv2.LINE_AA)
+        rects.append((bx, by1, bx2, by2, vista))
+        bx = bx2 + gap
+
+    # --- Estado del detector ML + cámara ---
+    y_estado = y0 + 66
+    if ml_postura is not None:
+        if ml_postura['encorvado']:
+            txt_ml, col_ml = f"ML: ENCORVADO ({ml_postura['prob']*100:.0f}%)", (0, 80, 255)
+        else:
+            txt_ml, col_ml = f"ML: erguido ({(1 - ml_postura['prob'])*100:.0f}%)", (0, 220, 0)
+    else:
+        txt_ml, col_ml = "ML: (sin modelo)", (150, 150, 150)
+    cv2.putText(lienzo, txt_ml, (12, y_estado), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, col_ml, 2, cv2.LINE_AA)
+    cv2.putText(lienzo, f"CAM {indice_camara}", (w - 95, y_estado),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # --- Leyenda de teclas ---
+    cv2.putText(lienzo,
+                "Q=salir   C=recalibrar   N=cambiar camara   1/2/3/0=vista (o click)",
+                (12, y0 + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190, 190, 190), 1,
+                cv2.LINE_AA)
+    return rects
 
 
 def _parsear_args():
@@ -161,11 +234,36 @@ def main():
     print(f"[OK] Cámara activada correctamente (índice {indice_camara}).")
     print()
     print("  Controles:")
-    print("    Q  → Salir")
-    print("    C  → Recalibrar postura erguida (presiona sentado derecho)")
-    print("    N  → Cambiar a la siguiente cámara (integrada / DroidCam / etc.)")
+    print("    Q        → Salir")
+    print("    C        → Recalibrar postura erguida (presiona sentado derecho)")
+    print("    N        → Cambiar a la siguiente cámara (integrada / DroidCam / etc.)")
+    print("    1/2/3/0  → Vista: Frente / Costado / Angulo / Automatico")
+    print("               (o haz click en los botones de la derecha)")
     print()
     print("-" * 60)
+
+    # ==========================================================================
+    # VENTANA + BOTONES DE VISTA (clicables con el ratón)
+    # ==========================================================================
+    # AUTOSIZE: la ventana toma el tamaño exacto del lienzo (vídeo + panel) y NO
+    # se puede redimensionar, de modo que las coordenadas del ratón coinciden 1:1
+    # con la imagen y los clicks en los botones caen siempre donde deben.
+    cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
+    # El callback lee estos rects (se rellenan cada frame). Se muta la MISMA lista
+    # in-place para que el closure vea siempre la última posición de los botones.
+    botones_rects = []
+
+    def _on_mouse(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        for (bx1, by1, bx2, by2, vista) in botones_rects:
+            if bx1 <= x <= bx2 and by1 <= y <= by2:
+                evaluador.set_vista_manual(vista)
+                nombre = 'AUTOMATICA' if vista is None else vista.upper()
+                print(f"[Vista] {nombre}")
+                break
+
+    cv2.setMouseCallback(WINDOW, _on_mouse)
 
     # ==========================================================================
     # VARIABLES DE CONTROL
@@ -256,27 +354,17 @@ def main():
         # ==================================================================
         visualizador.dibujar(frame, keypoints_2d, resultado)
 
-        # Banner del detector ML de encorvamiento (abajo-izquierda). Se dibuja
-        # aparte del HUD RULA para no tocar el visualizador.
-        if ml_postura is not None:
-            if ml_postura['encorvado']:
-                texto_ml = f"ML: ENCORVADO  ({ml_postura['prob']*100:.0f}%)"
-                color_ml = (0, 80, 255)          # naranja-rojo
-            else:
-                texto_ml = f"ML: erguido  ({(1-ml_postura['prob'])*100:.0f}%)"
-                color_ml = (0, 220, 0)           # verde
-            h_f = frame.shape[0]
-            cv2.putText(frame, texto_ml, (12, h_f - 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_ml, 2)
-
-        # Indicador de cámara activa (abajo-derecha): recuerda que 'N' la cambia.
-        texto_cam = f"CAM {indice_camara}  (N=cambiar)"
-        (tw, _), _ = cv2.getTextSize(texto_cam, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.putText(frame, texto_cam, (frame.shape[1] - tw - 12, frame.shape[0] - 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # Panel de control DEBAJO del vídeo (no encima), para que nada tape la
+        # imagen y todo se vea completo: botones de vista, estado ML y teclas.
+        h_f, w_f = frame.shape[:2]
+        panel = np.zeros((PANEL_ALTURA, w_f, 3), dtype=np.uint8)
+        lienzo = cv2.vconcat([frame, panel])
+        botones_rects[:] = _dibujar_panel_control(
+            lienzo, h_f, evaluador.vista_manual, ml_postura, indice_camara
+        )
 
         # Mostrar ventana
-        cv2.imshow('Analisis de Postura Ergonomica - RULA', frame)
+        cv2.imshow(WINDOW, lienzo)
 
         # Teclas de control
         key = cv2.waitKey(1) & 0xFF
@@ -320,6 +408,18 @@ def main():
             else:
                 print("[Camara] No hay otra camara disponible; "
                       f"se mantiene la actual (indice {indice_camara}).")
+        elif key == ord('1'):
+            evaluador.set_vista_manual('frontal')
+            print("[Vista] FRENTE (manual)")
+        elif key == ord('2'):
+            evaluador.set_vista_manual('lateral')
+            print("[Vista] COSTADO (manual)")
+        elif key == ord('3'):
+            evaluador.set_vista_manual('angulo')
+            print("[Vista] ANGULO (manual)")
+        elif key == ord('0'):
+            evaluador.set_vista_manual(None)
+            print("[Vista] AUTOMATICA")
 
     # ==========================================================================
     # LIMPIEZA
