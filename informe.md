@@ -399,6 +399,66 @@ Clase **`ClasificadorPostura`**. Dado `kp3d`, `predecir()` devuelve
 - **Degradación elegante**: si no existe `modelo_postura.joblib`, `disponible` es
   `False` y `predecir` devuelve `None`; el sistema sigue funcionando solo con RULA.
 
+### 8.5 Resultados del entrenamiento (instantánea)
+
+> ⚠️ **Esta subsección es una foto de un momento**, no una propiedad fija del
+> sistema. Cada vez que se recolectan más sesiones y se reentrena, estos números
+> cambian. Última actualización: **2026-07-23**, con **6919 filas en 4 sesiones**
+> (3469 erguido / 3450 encorvado), validación **GroupKFold por sesión (4 folds)**.
+
+**Evolución al ir sumando sesiones** (exactitud por validación honesta entre
+sesiones):
+
+| Reentrenamiento | Sesiones | Filas | Exactitud | Recall erguido | Recall encorvado |
+|---|---|---|---|---|---|
+| 1º | 2 | 2074 | 79 % | 0.74 | 0.83 |
+| 2º | 3 | 5538 | 71 % | 0.55 | 0.87 |
+| 3º | 4 | 6919 | **75 %** | **0.68** | 0.81 |
+
+**Matriz de confusión actual** (filas = real, columnas = predicho):
+
+|  | pred. erguido | pred. encorvado |
+|---|---|---|
+| **real erguido** | 2369 | 1100 |
+| **real encorvado** | 661 | 2789 |
+
+**Reporte de clasificación actual:**
+
+| Clase | Precisión | Recall | F1 |
+|---|---|---|---|
+| erguido | 0.78 | 0.68 | 0.73 |
+| encorvado | 0.72 | 0.81 | 0.76 |
+| **exactitud global** | | | **0.75** |
+
+**Importancia de features (top 5)** — qué distingue de verdad la postura:
+
+| Feature | Importancia |
+|---|---|
+| `nariz_vs_orejas_y` | 0.251 |
+| `cabeza_caida_y` | 0.132 |
+| `altura_torso_rel` | 0.126 |
+| `cabeza_adelantada_z` | 0.070 |
+| `hombro_asimetria_z` | 0.066 |
+
+**Lectura de estos números — el hallazgo de los "dos regímenes":** existen dos
+condiciones de captura distintas. A **distancia normal** la postura se distingue
+sobre todo por el **tronco**; en **primer plano** (cadera inferida, §4.3) el tronco
+casi no cambia y la señal se traslada a la **cabeza/cuello** (`nariz_vs_orejas_y`,
+`cabeza_caida_y`). Un modelo entrenado en un régimen **no** transfiere bien al otro
+(se midió ~64 % cruzado), pero **cada régimen por separado es muy separable**
+(~98 % intra-sesión de primer plano). Por eso:
+
+- El **GroupKFold es pesimista a propósito**: esconde una sesión entera (a menudo
+  un régimen entero), así que mide "¿generaliza a una condición nunca vista?". El
+  modelo **desplegado se entrena con TODO** (ambos regímenes), por lo que en la
+  práctica funciona mejor que la cifra de validación.
+- Sumar **sesiones variadas** (distancias, luz, ropa, personas) sube la métrica
+  cruzada, porque el modelo ve el rango completo. Se observa ya en la tabla: la 4ª
+  sesión recuperó el recall de "erguido" de 0.55 → 0.68.
+
+Para regenerar esta instantánea basta con `python entrenar_modelo.py`, que imprime
+exactamente estas tablas por consola.
+
 ---
 
 ## 9. Orquestación y bucle principal (`Postura.py`)
