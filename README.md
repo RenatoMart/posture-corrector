@@ -157,4 +157,17 @@ Puedes abrir el archivo `config.py` para adaptar el programa a tus necesidades. 
 - **Banda del score del cuello** (`CUELLO_NEUTRO_MIN` / `CUELLO_NEUTRO_MAX` / `CUELLO_EXTENSION_MARCADA` / `CUELLO_FLEXION_MODERADA`): el cuello se puntúa por una **banda neutra** (score 1 entre 15°–23°), con dos niveles a cada lado — mirar hacia arriba (por debajo de 15°, luego de 12°) y hacia abajo (por encima de 23°, luego de 32°). El ángulo neutro aparece "inflado" (~15-20°) porque se mide desde los hombros; ajusta la banda a tu neutro real mirando el ángulo en el HUD.
 - `ENCORVADO_ACTIVO`: Activa/desactiva la detección de encorvamiento lateral por silueta. Los parámetros `ENCORVADO_*` ajustan su sensibilidad: sube `ENCORVADO_RESIDUO_MAX` para ser más permisivo con fondos complejos, o baja `ENCORVADO_GANANCIA` si detecta encorvamiento de más.
 
-> **Umbral del detector ML:** el punto de disparo del clasificador de encorvamiento se ajusta en `Postura.py`, al instanciar `ClasificadorPostura(umbral_on=0.6, umbral_off=0.4)`. Sube `umbral_on` (p.ej. a `0.7`) para que sea más conservador y dé menos falsas alarmas.
+### Detector ML de encorvamiento
+
+Todos sus parámetros están ahora en `config.py` (antes había que editar `Postura.py`):
+
+- `ML_ACTIVO`: `False` desactiva el detector aunque exista `modelo_postura.joblib`.
+- `ML_UMBRAL_ON` / `ML_UMBRAL_OFF`: punto de disparo y de apagado (histéresis), hoy `0.60` / `0.40`. Súbelos para que sea más conservador, bájalos si te avisa poco.
+- `SESIONES_EXCLUIDAS`: lista de sesiones del CSV que `entrenar_modelo.py` ignora, **sin borrar sus filas**. Sirve para descartar una grabación que empeore el modelo y poder reincorporarla después quitando su id de la lista.
+- `ML_ALPHA`: suavizado temporal de la probabilidad (mayor = más reactivo).
+- `ML_DISPARA_ALARMA`: `False` = el modelo solo informa en pantalla, nunca suena.
+- `ML_FRAMES_ALARMA`: frames seguidos encorvado para contar como riesgo (90 ≈ 3 s). **Es el ajuste más útil si te avisa de más o de menos.**
+
+> **El ML no dispara al instante a propósito.** Trabaja junto a RULA como segunda fuente de riesgo, y cubre el caso donde RULA se queda corto: sentado con la cadera oculta tras el escritorio, el tronco parece vertical y el score no sube pese al encorvamiento real. Como a nivel de frame ~1 de cada 5 frames erguido cruza el umbral, la alarma exige **postura sostenida**: primero `ML_FRAMES_ALARMA` frames encorvado, y luego el `UMBRAL_FRAMES_ALARMA` habitual → suena a los **~4,5 s**. Ese filtro deja las falsas alarmas en 2 frente a 18 correctas sobre las 6 sesiones entrenadas (detalle y barrido de umbrales en `informe.md` §8.6).
+
+> **Si reentrenas, revisa el umbral — y comprueba que el modelo mejoró en lo que te importa.** El umbral óptimo cambió en cada reentrenamiento (`0.60`, `0.80`, `0.70`), así que rehaz el barrido de `informe.md` §8.6. Y mira el recall por clase, no solo la exactitud global: dos sesiones posteriores se probaron y se descartaron (siguen en `SESIONES_EXCLUIDAS`), y el modelo desplegado es el de **6 sesiones**. **Lección: para mejorar, graba la clase que falla (erguido) y exagera el encorvamiento; los ejemplos ambiguos hacen daño.**

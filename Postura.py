@@ -33,6 +33,8 @@ from config import (
     ALARMA_FRECUENCIA_HZ, ALARMA_DURACION_MS,
     UMBRAL_FRAMES_ALARMA, UMBRAL_FRAMES_LIBERA, UMBRAL_RULA_ALARMA,
     SUAVIZADO_ONEEURO, ONEEURO_2D_MIN_CUTOFF, ONEEURO_2D_BETA, ONEEURO_2D_D_CUTOFF,
+    ML_ACTIVO, ML_UMBRAL_ON, ML_UMBRAL_OFF, ML_ALPHA,
+    ML_DISPARA_ALARMA, ML_FRAMES_ALARMA,
 )
 
 
@@ -85,7 +87,48 @@ def _listar_camaras():
 PANEL_ALTURA = 118   # alto del panel de control debajo del vídeo
 
 
-def _dibujar_panel_control(lienzo, y0, vista_manual, ml_postura, indice_camara):
+def _dibujar_aviso_ml(frame, ml_postura, frames_ml):
+    """
+    Dibuja sobre el VÍDEO el aviso del detector ML de encorvamiento.
+
+    El panel de abajo da el detalle numérico, pero mirando la cámara uno no lee
+    texto pequeño: esto es la señal grande y de color que sí se percibe de reojo.
+    Solo aparece cuando el modelo marca encorvado, para no ensuciar la imagen.
+
+    Args:
+        frame: imagen del vídeo (se modifica in-place).
+        ml_postura: dict del clasificador o None.
+        frames_ml: frames seguidos que el modelo lleva marcando encorvado.
+    """
+    if ml_postura is None or not ml_postura['encorvado']:
+        return
+
+    h, w = frame.shape[:2]
+    # Rojo cuando el encorvamiento ya se sostuvo lo suficiente para ser riesgo;
+    # naranja mientras solo es un aviso temprano.
+    confirmado = ML_DISPARA_ALARMA and frames_ml >= ML_FRAMES_ALARMA
+    color = (0, 0, 255) if confirmado else (0, 140, 255)
+    texto = "ENCORVADO" if confirmado else "encorvandote..."
+
+    (tw, th), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+    x0, y0 = (w - tw) // 2 - 14, 8
+    x1, y1 = x0 + tw + 28, y0 + th + 18
+
+    # Fondo semitransparente para que el texto se lea sobre cualquier escena.
+    capa = frame.copy()
+    cv2.rectangle(capa, (x0, y0), (x1, y1), (25, 25, 25), -1)
+    cv2.addWeighted(capa, 0.55, frame, 0.45, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 2)
+    cv2.putText(frame, texto, (x0 + 14, y1 - 9), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, color, 2, cv2.LINE_AA)
+
+    # Marco rojo alrededor del vídeo cuando ya es riesgo confirmado.
+    if confirmado:
+        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), color, 3)
+
+
+def _dibujar_panel_control(lienzo, y0, vista_manual, ml_postura, indice_camara,
+                           frames_ml=0):
     """
     Dibuja el panel de control DEBAJO del vídeo (no encima), estilo recolectar.
 
@@ -98,6 +141,8 @@ def _dibujar_panel_control(lienzo, y0, vista_manual, ml_postura, indice_camara):
         vista_manual: vista fijada a mano o None (automático). Resalta el activo.
         ml_postura: dict del clasificador ML o None.
         indice_camara: índice de la cámara activa.
+        frames_ml: frames seguidos encorvado según el ML (para la barra de progreso
+            hacia la alarma).
 
     Returns:
         Lista de rectángulos [(x1, y1, x2, y2, vista), ...] EN COORDENADAS DEL
@@ -143,6 +188,19 @@ def _dibujar_panel_control(lienzo, y0, vista_manual, ml_postura, indice_camara):
                 0.6, col_ml, 2, cv2.LINE_AA)
     cv2.putText(lienzo, f"CAM {indice_camara}", (w - 95, y_estado),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Barra de "cuánto llevas encorvado" hacia la alarma: hace visible que el ML
+    # exige sostener la postura y no dispara por un mal frame suelto.
+    if ML_DISPARA_ALARMA and frames_ml > 0:
+        frac = min(1.0, frames_ml / float(max(1, ML_FRAMES_ALARMA)))
+        bx1, bar_y, bx2, bar_h = 300, y_estado - 14, w - 110, 16
+        cv2.rectangle(lienzo, (bx1, bar_y), (bx2, bar_y + bar_h), (60, 60, 60), -1)
+        ancho = int((bx2 - bx1) * frac)
+        col_bar = (0, 0, 255) if frac >= 1.0 else (0, 140, 255)
+        if ancho > 0:
+            cv2.rectangle(lienzo, (bx1, bar_y), (bx1 + ancho, bar_y + bar_h),
+                          col_bar, -1)
+        cv2.rectangle(lienzo, (bx1, bar_y), (bx2, bar_y + bar_h), (140, 140, 140), 1)
 
     # --- Leyenda de teclas ---
     cv2.putText(lienzo,
@@ -195,7 +253,12 @@ def main():
     # Clasificador ML de encorvamiento (Random Forest entrenado con tus datos).
     # Si no existe modelo_postura.joblib, queda 'no disponible' y el sistema
     # sigue funcionando solo con RULA (no rompe nada).
-    clasificador = ClasificadorPostura()
+    clasificador = ClasificadorPostura(
+        umbral_on=ML_UMBRAL_ON,
+        umbral_off=ML_UMBRAL_OFF,
+        alpha=ML_ALPHA,
+        activo=ML_ACTIVO,
+    )
 
     # Estabilizador anti-jitter de la pose 2D (los puntos que se dibujan en
     # pantalla). Solo suaviza x,y (n_coords=2); la visibilidad se conserva.
@@ -268,9 +331,10 @@ def main():
     # ==========================================================================
     # VARIABLES DE CONTROL
     # ==========================================================================
-    frames_riesgo = 0        # Frames consecutivos con RULA alto
-    frames_ok = 0            # Frames consecutivos con buena postura (para histéresis)
-    alarma_activa = False    # Evitar alarmas repetitivas
+    frames_riesgo = 0          # Frames consecutivos en riesgo (RULA y/o ML)
+    frames_ok = 0              # Frames consecutivos con buena postura (para histéresis)
+    frames_ml_encorvado = 0    # Frames seguidos que el modelo ML marca encorvado
+    alarma_activa = False      # Evitar alarmas repetitivas
     fallos_lectura = 0       # Frames fallidos seguidos (para no morir por un hipo)
     MAX_FALLOS = 60          # ~2 s a 30 FPS antes de rendirse
 
@@ -331,16 +395,36 @@ def main():
         # ==================================================================
         # CONTROL DE ALARMA
         # ==================================================================
-        en_riesgo = (resultado is not None
-                     and resultado['score_final'] >= UMBRAL_RULA_ALARMA)
+        # Dos fuentes de riesgo INDEPENDIENTES, cada una con su propio contador:
+        #   - RULA: ángulos contra las tablas ergonómicas estándar.
+        #   - ML:   el Random Forest entrenado con tus propias sesiones, que
+        #           reconoce tu encorvamiento aunque el score RULA no llegue al
+        #           umbral (típico al estar sentado, donde la cadera se ve mal).
+        # El ML necesita sostenerse MÁS frames (ML_FRAMES_ALARMA) porque tiene
+        # más falsos positivos que RULA; así un aviso suelto no hace sonar nada.
+        riesgo_rula = (resultado is not None
+                       and resultado['score_final'] >= UMBRAL_RULA_ALARMA)
+
+        if ml_postura is not None and ml_postura['encorvado']:
+            frames_ml_encorvado += 1
+        else:
+            frames_ml_encorvado = 0
+        riesgo_ml = (ML_DISPARA_ALARMA
+                     and frames_ml_encorvado >= ML_FRAMES_ALARMA)
+
+        en_riesgo = riesgo_rula or riesgo_ml
         if en_riesgo:
             frames_riesgo += 1
             frames_ok = 0
             if frames_riesgo >= UMBRAL_FRAMES_ALARMA and not alarma_activa:
                 emitir_alarma_async()
                 alarma_activa = True
-                print(f"[!] ALARMA: Score RULA {resultado['score_final']} "
-                      f"- {resultado['texto']}")
+                if riesgo_rula:
+                    print(f"[!] ALARMA: Score RULA {resultado['score_final']} "
+                          f"- {resultado['texto']}")
+                else:
+                    print(f"[!] ALARMA: encorvamiento sostenido detectado por el "
+                          f"modelo ({ml_postura['prob'] * 100:.0f}% de certeza).")
         else:
             # Histéresis: solo se libera tras varios frames buenos seguidos,
             # para que un único frame ruidoso no apague ni reinicie la alarma.
@@ -354,13 +438,17 @@ def main():
         # ==================================================================
         visualizador.dibujar(frame, keypoints_2d, resultado)
 
+        # Aviso grande del detector ML sobre el propio vídeo (solo si encorvado).
+        _dibujar_aviso_ml(frame, ml_postura, frames_ml_encorvado)
+
         # Panel de control DEBAJO del vídeo (no encima), para que nada tape la
         # imagen y todo se vea completo: botones de vista, estado ML y teclas.
         h_f, w_f = frame.shape[:2]
         panel = np.zeros((PANEL_ALTURA, w_f, 3), dtype=np.uint8)
         lienzo = cv2.vconcat([frame, panel])
         botones_rects[:] = _dibujar_panel_control(
-            lienzo, h_f, evaluador.vista_manual, ml_postura, indice_camara
+            lienzo, h_f, evaluador.vista_manual, ml_postura, indice_camara,
+            frames_ml_encorvado
         )
 
         # Mostrar ventana
@@ -376,6 +464,7 @@ def main():
             elevador.recalibrar()
             evaluador.recalibrar()
             clasificador.reset()
+            frames_ml_encorvado = 0
             if estabilizador_2d is not None:
                 estabilizador_2d.reset()
             print("[Calibracion] Linea base de postura erguida reiniciada.")
@@ -402,6 +491,7 @@ def main():
                 elevador.recalibrar()
                 evaluador.recalibrar()
                 clasificador.reset()
+                frames_ml_encorvado = 0
                 if estabilizador_2d is not None:
                     estabilizador_2d.reset()
                 print(f"[Camara] Cambiada a indice {indice_camara}.")

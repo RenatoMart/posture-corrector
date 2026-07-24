@@ -22,7 +22,7 @@ import os
 
 import numpy as np
 
-from features_postura import vector_features
+from features_postura import FEATURE_NAMES, vector_features
 
 try:
     import joblib
@@ -44,9 +44,11 @@ class ClasificadorPostura:
         umbral_off: probabilidad por debajo de la cual se APAGA (más baja que
             umbral_on para dar histéresis y evitar parpadeos).
         alpha: factor del suavizado exponencial (EMA) de la probabilidad.
+        activo: False desactiva el detector aunque el .joblib exista (config.ML_ACTIVO).
     """
 
-    def __init__(self, ruta=MODELO_PATH, umbral_on=0.6, umbral_off=0.4, alpha=0.3):
+    def __init__(self, ruta=MODELO_PATH, umbral_on=0.6, umbral_off=0.4, alpha=0.3,
+                 activo=True):
         self.umbral_on = umbral_on
         self.umbral_off = umbral_off
         self.alpha = alpha
@@ -56,16 +58,33 @@ class ClasificadorPostura:
 
         self.modelo = None
         self.features = None
+        self.n_muestras = None
         self.disponible = False
 
-        if _JOBLIB_OK and os.path.exists(ruta):
+        if not activo:
+            print("[ClasificadorPostura] Desactivado por config (ML_ACTIVO=False). "
+                  "El sistema usará solo RULA.")
+        elif _JOBLIB_OK and os.path.exists(ruta):
             try:
                 data = joblib.load(ruta)
                 self.modelo = data['modelo']
                 self.features = data.get('features')
+                self.n_muestras = data.get('n_muestras')
                 self.disponible = True
                 print(f"[ClasificadorPostura] Modelo cargado "
                       f"({data.get('n_muestras', '?')} muestras de entrenamiento).")
+                # Guarda contra el fallo SILENCIOSO más peligroso de este flujo:
+                # que el modelo se haya entrenado con otras features (u otro
+                # orden) que las que calcula features_postura.py ahora mismo. En
+                # ese caso el RF recibiría números que no corresponden a las
+                # columnas que aprendió y acertaría por casualidad.
+                if self.features is not None and list(self.features) != list(FEATURE_NAMES):
+                    print("[ClasificadorPostura] AVISO: las features del modelo NO "
+                          "coinciden con features_postura.py.")
+                    print(f"    modelo : {list(self.features)}")
+                    print(f"    actual : {list(FEATURE_NAMES)}")
+                    print("    → Vuelve a correr entrenar_modelo.py. Se desactiva el ML.")
+                    self.disponible = False
             except Exception as e:
                 print(f"[ClasificadorPostura] No se pudo cargar el modelo: {e}")
         else:

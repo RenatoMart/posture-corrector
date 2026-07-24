@@ -411,6 +411,17 @@ números (no imágenes) en `datos_postura.csv`, que se **acumula** entre sesione
   `StratifiedKFold` y avisa de que la cifra puede ser optimista.)
 - Reporta **matriz de confusión**, precisión/recall por clase e **importancia de
   cada feature** (qué ángulos distinguen de verdad la postura).
+- **Exclusión de sesiones** (`config.SESIONES_EXCLUIDAS`): lista de identificadores
+  de sesión que se dejan fuera del entrenamiento **sin borrar sus filas del CSV**.
+  Nace de una necesidad real (§8.5): una grabación puede empeorar el modelo, y
+  entonces hace falta poder retroceder sin perder los datos, porque esa misma
+  sesión puede volver a ser útil cuando otras compensen su sesgo. El script
+  **avisa por consola** de cuántas filas y qué sesiones excluyó, para que nadie
+  lea las métricas creyendo que se entrenó con todo el CSV.
+- **El entrenamiento es determinista** (`random_state=42`): con los mismos datos y
+  la misma versión de scikit-learn se reproduce el modelo exacto. Gracias a eso, un
+  modelo anterior no se "pierde" al sobrescribir el `.joblib` — se recupera
+  reentrenando con el mismo subconjunto de sesiones.
 
 ### 8.4 Inferencia en vivo — `clasificador_postura.py`
 
@@ -420,19 +431,32 @@ Clase **`ClasificadorPostura`**. Dado `kp3d`, `predecir()` devuelve
 - **Probabilidad** de la clase "encorvado" (`predict_proba`).
 - **Suavizado temporal (EMA, `alpha=0.3`)** para no reaccionar al ruido de un solo
   frame.
-- **Histéresis** con dos umbrales (`umbral_on=0.6`, `umbral_off=0.4`): la señal se
-  **enciende** al superar 0.6 y solo se **apaga** al bajar de 0.4, evitando el
-  parpadeo cerca del punto de corte. Subir `umbral_on` lo hace más conservador
-  (menos falsas alarmas).
+- **Histéresis** con dos umbrales (`ML_UMBRAL_ON` / `ML_UMBRAL_OFF`, hoy **0.60 /
+  0.40**): la señal se **enciende** al superar el primero y solo se **apaga** al
+  bajar del segundo, evitando el parpadeo cerca del punto de corte. Subir
+  `ML_UMBRAL_ON` lo hace más conservador (menos falsas alarmas); el barrido que
+  justifica los valores actuales está en §8.6.
 - **Degradación elegante**: si no existe `modelo_postura.joblib`, `disponible` es
   `False` y `predecir` devuelve `None`; el sistema sigue funcionando solo con RULA.
+  Lo mismo con `ML_ACTIVO = False`, que lo desactiva aunque el modelo exista.
+- **Guarda contra el fallo silencioso**: al cargar se comprueba que la lista de
+  features guardada en el `.joblib` **coincida en contenido y orden** con
+  `FEATURE_NAMES` de `features_postura.py`. Si alguien añade o reordena una feature
+  y olvida reentrenar, el Random Forest recibiría columnas que no corresponden a
+  las que aprendió y **acertaría por casualidad, sin error visible**. Ante un
+  desajuste se avisa por consola y el detector se desactiva en vez de mentir.
 
 ### 8.5 Resultados del entrenamiento (instantánea)
 
 > ⚠️ **Esta subsección es una foto de un momento**, no una propiedad fija del
 > sistema. Cada vez que se recolectan más sesiones y se reentrena, estos números
-> cambian. Última actualización: **2026-07-23**, con **6919 filas en 4 sesiones**
-> (3469 erguido / 3450 encorvado), validación **GroupKFold por sesión (4 folds)**.
+> cambian. Última actualización: **2026-07-23**, con **11 503 filas en 6 sesiones**
+> (5104 erguido / 6399 encorvado), validación **GroupKFold por sesión (5 folds;
+> `n_splits = min(5, n_sesiones)`, así que con 6 sesiones un fold agrupa dos)**.
+>
+> El CSV contiene además dos sesiones (`20260723_224143` y `20260723_232603`,
+> 7047 filas) **excluidas** del entrenamiento vía `config.SESIONES_EXCLUIDAS`, por
+> los motivos que se explican al final de esta subsección.
 
 **Evolución al ir sumando sesiones** (exactitud por validación honesta entre
 sesiones):
@@ -441,32 +465,49 @@ sesiones):
 |---|---|---|---|---|---|
 | 1º | 2 | 2074 | 79 % | 0.74 | 0.83 |
 | 2º | 3 | 5538 | 71 % | 0.55 | 0.87 |
-| 3º | 4 | 6919 | **75 %** | **0.68** | 0.81 |
+| 3º | 4 | 6919 | 75 % | 0.68 | 0.81 |
+| 4º | 5 | 8685 | 78 % | 0.71 | 0.84 |
+| 6 | 11 503 | **79 %** | **0.71** | **0.86** | ← **desplegado** |
+| ~~+224143~~ | ~~7~~ | ~~14 664~~ | ~~74 %~~ ⚠️ | ~~0.63~~ ⚠️ | ~~0.83~~ | ← revertido |
+| ~~+232603~~ | ~~7~~ | ~~15 389~~ | ~~77 %~~ | ~~0.72~~ | ~~0.83~~ | ← revertido |
 
 **Matriz de confusión actual** (filas = real, columnas = predicho):
 
 |  | pred. erguido | pred. encorvado |
 |---|---|---|
-| **real erguido** | 2369 | 1100 |
-| **real encorvado** | 661 | 2789 |
+| **real erguido** | 3631 | 1473 |
+| **real encorvado** | 915 | 5484 |
 
 **Reporte de clasificación actual:**
 
 | Clase | Precisión | Recall | F1 |
 |---|---|---|---|
-| erguido | 0.78 | 0.68 | 0.73 |
-| encorvado | 0.72 | 0.81 | 0.76 |
-| **exactitud global** | | | **0.75** |
+| erguido | 0.80 | 0.71 | 0.75 |
+| encorvado | 0.79 | 0.86 | 0.82 |
+| **exactitud global** | | | **0.79** |
 
 **Importancia de features (top 5)** — qué distingue de verdad la postura:
 
 | Feature | Importancia |
 |---|---|
-| `nariz_vs_orejas_y` | 0.251 |
-| `cabeza_caida_y` | 0.132 |
-| `altura_torso_rel` | 0.126 |
-| `cabeza_adelantada_z` | 0.070 |
-| `hombro_asimetria_z` | 0.066 |
+| `nariz_vs_orejas_y` | 0.264 |
+| `cabeza_caida_y` | 0.136 |
+| `altura_torso_rel` | 0.099 |
+| `curvatura_toracica` | 0.069 |
+| `hombros_protraccion_z` | 0.067 |
+
+> ⚠️ **Dos reentrenamientos posteriores se probaron y se revirtieron**, y por eso
+> el modelo desplegado sigue siendo el de **6 sesiones**:
+> - **+`224143`** (mucho encorvado sutil) bajó la exactitud de 79 % a 74 % y el
+>   recall de "erguido" de 0.71 a 0.63. **Más datos no siempre es mejor.**
+> - **+`232603`** (sesión de calidad, mayoritariamente erguida, separación d = 1.10)
+>   subió el recall de "erguido" a 0.72, pero el modelo resultó globalmente peor
+>   que el de 6 (77 % vs 79 %, más alarmas falsas en la simulación en vivo y peor
+>   recall de "encorvado"). Sus datos son buenos: es el **primer candidato a
+>   reincorporar** cuando se sumen más grabaciones erguidas y se rehaga el barrido.
+>
+> Ambas siguen en `config.SESIONES_EXCLUIDAS` (sin borrar sus filas del CSV). Las
+> causas del problema de fondo se analizan justo abajo.
 
 **Lectura de estos números — el hallazgo de los "dos regímenes":** existen dos
 condiciones de captura distintas. A **distancia normal** la postura se distingue
@@ -481,11 +522,106 @@ casi no cambia y la señal se traslada a la **cabeza/cuello** (`nariz_vs_orejas_
   modelo **desplegado se entrena con TODO** (ambos regímenes), por lo que en la
   práctica funciona mejor que la cifra de validación.
 - Sumar **sesiones variadas** (distancias, luz, ropa, personas) sube la métrica
-  cruzada, porque el modelo ve el rango completo. Se observa ya en la tabla: la 4ª
-  sesión recuperó el recall de "erguido" de 0.55 → 0.68.
+  cruzada, porque el modelo ve el rango completo. Se observó al pasar de 3 a 6
+  sesiones: el recall de "erguido" se recuperó de 0.55 → 0.68 → 0.71 y la exactitud
+  global de 71 % → 79 %.
+- **Pero añadir la sesión `224143` rompió esa tendencia** (79 % → 74 %, recall
+  erguido 0.71 → 0.63). La causa más probable está en el **desbalance que se fue
+  acumulando**: las últimas grabaciones aportan ~2 filas de "encorvado" por cada una
+  de "erguido" (esa sesión: 1025 vs 2136). `class_weight` compensa el *peso* de cada
+  clase, pero no puede inventar la **variedad** que falta: el modelo conocía muchas
+  más configuraciones distintas de encorvado que de erguido, así que ante una
+  postura erguida no vista antes tendía a votar "encorvado". La matriz de aquel
+  intento lo mostraba: los errores se concentraban en `real erguido → pred.
+  encorvado` (2261 de 6129).
+- **Decisión tomada:** volver al modelo de 6 sesiones. Las dos grabaciones
+  posteriores (`224143` y `232603`) se añadieron a `config.SESIONES_EXCLUIDAS`, que
+  las deja fuera del entrenamiento **sin borrar sus filas del CSV**. Es reversible en
+  una línea: quitar el id de la lista reincorpora esas filas. La `232603` es de
+  calidad y será la primera en volver cuando se sumen más datos erguidos.
+- **El experimento decisivo (medido sobre estos datos).** Se simuló añadir solo
+  partes de una grabación al modelo, evaluando siempre sobre el mismo conjunto:
+
+  | Qué se añade al entrenamiento | Exactitud | Recall erguido |
+  |---|---|---|
+  | Nada (modelo base) | 0.788 | 0.704 |
+  | Solo filas **erguido** | 0.793 | **0.753** ✅ |
+  | Solo filas **encorvado** | 0.735 | 0.523 ❌ |
+  | Balanceado 1:1 | 0.760 | 0.626 |
+
+  Dos conclusiones: (1) grabar **erguido** sube el recall de "erguido"; (2) incluso
+  el balanceado 1:1 empeora, así que el problema de fondo **no es solo el conteo**.
+- **La causa raíz real: el encorvamiento grabado se volvió sutil.** Midiendo la
+  separación entre clases *dentro* de cada sesión (d de Cohen y diferencia de
+  flexión de tronco erguido→encorvado): la 1ª sesión separaba 18.6°, pero varias
+  posteriores caen a 1–4° (la `113137`: **0.1°**, clases casi idénticas con
+  etiquetas opuestas). Enseñarle al modelo que una postura casi recta es
+  "encorvado" es lo que hunde el recall de "erguido". **Al grabar encorvado hay que
+  exagerarlo**; los ejemplos ambiguos hacen más daño que bien.
+- **Qué grabar la próxima vez:** **mayoritariamente erguido** y en una condición
+  distinta (otra distancia, otra silla, otra luz), y el encorvado bien marcado.
+  Nótese que el recall de "encorvado" se mantiene alto (~0.83): **el problema no es
+  detectar el encorvamiento, es
+  reconocer la postura buena**.
 
 Para regenerar esta instantánea basta con `python entrenar_modelo.py`, que imprime
 exactamente estas tablas por consola.
+
+### 8.6 Del score al aviso: por qué la alarma exige postura SOSTENIDA
+
+Las métricas de arriba se miden **por frame**, pero el sistema no avisa por frame.
+Esa distinción es la que decide si la herramienta resulta usable o insoportable.
+
+Al **punto de operación actual** (`ML_UMBRAL_ON = 0.60`), un **21.7 %** de los
+frames etiquetados "erguido" cruzan el umbral en validación entre sesiones (1108 de
+5104). Si la alarma se disparara con el primer frame marcado, sonaría
+constantemente.
+
+Por eso el veredicto ML atraviesa **tres filtros en cascada** antes de sonar:
+
+| Filtro | Dónde | Efecto |
+|---|---|---|
+| EMA (`alpha = 0.3`) | `ClasificadorPostura` | Diluye el pico de un frame aislado |
+| Histéresis (`ML_UMBRAL_ON` / `_OFF`) | `ClasificadorPostura` | Impide el parpadeo cerca del corte |
+| Sostenido (`ML_FRAMES_ALARMA = 90`) | `Postura.py` | Exige ~3 s de encorvamiento continuo |
+
+**Barrido del punto de operación** (simulando las 6 sesiones como si se
+reprodujeran en vivo: se entrena sin la sesión evaluada y se aplica la cascada
+completa). Cada fila es una configuración posible:
+
+| `ML_UMBRAL_ON` / `_OFF` | `ML_FRAMES_ALARMA` | Alarmas FALSAS | Correctas | % frames FP |
+|---|---|---|---|---|
+| **0.60 / 0.40** | **90** | **2** | **18** | 21.7 % ← **elegida** |
+| 0.60 / 0.40 | 150 | 0 | 12 | 21.7 % |
+| 0.70 / 0.50 | 90 | 2 | 18 | 15.8 % |
+| 0.75 / 0.55 | 90 | 2 | 18 | 12.4 % |
+| 0.80 / 0.60 | 90 | 2 | 14 | 8.2 % |
+| 0.80 / 0.60 | 150 | 0 | 10 | 8.2 % |
+
+Con **90 frames de sostenido**, subir el umbral de 0.60 a 0.75 no cambia el
+resultado de las alarmas (2 falsas / 18 correctas) pero **reduce el ruido por
+frame** (21.7 % → 12.4 %), lo que da un cartel en pantalla más estable. Pasado ese
+punto, 0.80 ya sacrifica detecciones reales (18 → 14) sin ganar en falsas. Alargar
+el sostenido elimina las falsas pero cuesta carísimo en detecciones (18 → 12) y
+retrasa el aviso 2 s. Por eso se eligió **0.60/0.40** (mínimo que ya da 2 falsas).
+
+> ⚠️ **El umbral óptimo depende del modelo, no es una constante.** Este mismo
+> barrido ha dado ganadores **distintos** según el entrenamiento: **0.60/0.40** con
+> el modelo de 6 sesiones (el actual), **0.80/0.60** con el modelo que incluía
+> `224143`, **0.70/0.50** con el que incluía `232603`. Un mismo umbral cambia por
+> completo de sentido según el modelo: el 0.80 fue el mejor y el peor con pocas
+> horas de diferencia. **Al reentrenar hay que rehacer este barrido**; mirar solo la
+> exactitud no basta.
+
+El motivo de fondo es que umbral y sostenido atacan cosas distintas: el umbral corta
+el **ruido de amplitud** (probabilidades tibias de una postura ambigua) y el
+sostenido corta el **ruido de duración** (rachas cortas). Si el modelo se vuelve
+"gritón" en general, el instrumento adecuado es el umbral; alargar el sostenido
+penaliza por igual a las detecciones buenas.
+
+> **Lectura clave:** el modelo no necesita ser perfecto por frame para ser útil.
+> El encorvamiento es una postura **sostenida**, no un instante, y explotar esa
+> propiedad temporal convierte un clasificador del 79 % en un avisador fiable.
 
 ---
 
@@ -512,9 +648,21 @@ exactamente estas tablas por consola.
    - **Fase 2**: `elevador.elevar(keypoints_world)`.
    - **Fase 3**: `evaluador.evaluar(keypoints_3d, keypoints_2d, frame)`.
    - **Detector ML**: `clasificador.predecir(keypoints_3d)`.
-   - **Control de alarma con histéresis**: en riesgo (`score >= UMBRAL_RULA_ALARMA`)
-     durante `UMBRAL_FRAMES_ALARMA` frames → dispara `emitir_alarma_async()`; se
-     libera solo tras `UMBRAL_FRAMES_LIBERA` frames buenos seguidos.
+   - **Control de alarma con histéresis — DOS fuentes de riesgo independientes**:
+     - `riesgo_rula`: `score_final >= UMBRAL_RULA_ALARMA` (ángulos contra las
+       tablas ergonómicas estándar).
+     - `riesgo_ml`: el clasificador marca encorvado durante `ML_FRAMES_ALARMA`
+       (90) frames **seguidos**. Cubre justo el caso donde RULA se queda corto:
+       sentado, con la cadera oculta tras el escritorio (§4.3), el tronco parece
+       vertical y el score RULA no sube pese al encorvamiento real.
+
+     Se entra en riesgo con `riesgo_rula OR riesgo_ml`; a partir de ahí se aplica
+     el mismo `UMBRAL_FRAMES_ALARMA` de siempre → `emitir_alarma_async()`, y se
+     libera solo tras `UMBRAL_FRAMES_LIBERA` frames buenos seguidos. En la
+     práctica la alarma **por ML** suena a los ~90 + 45 frames (**~4,5 s**), no a
+     los 3 s que sugiere `ML_FRAMES_ALARMA` por sí solo (ver §8.6). El mensaje de
+     consola indica **qué fuente** disparó. Con `ML_DISPARA_ALARMA = False` el
+     modelo solo informa en pantalla y nunca suena.
    - **Visualización**: `visualizador.dibujar(...)` sobre el vídeo, y luego un
      **panel de control DEBAJO** del vídeo (`cv2.vconcat`, ver más abajo), para que
      nada tape la imagen.
@@ -536,7 +684,18 @@ contiene, siempre visible y sin tapar la imagen:
   activo se resalta en verde. Las teclas `1/2/3/0` hacen lo mismo.
 - **Estado del detector ML** (`ML: erguido / ENCORVADO` con su probabilidad) y el
   **índice de cámara** activa.
+- **Barra de progreso hacia la alarma ML**: se llena conforme se acumulan los
+  `ML_FRAMES_ALARMA` frames encorvado (naranja mientras carga, roja al
+  completarse). Hace visible que el aviso exige postura sostenida y no depende de
+  un frame suelto.
 - **Leyenda de teclas**.
+
+**Aviso ML sobre el vídeo** (`_dibujar_aviso_ml`, en `Postura.py`): el panel
+inferior da el detalle numérico, pero de reojo no se lee texto pequeño. Cuando el
+modelo marca encorvado se superpone un **cartel central** sobre la imagen —
+naranja (`encorvandote...`) mientras se acumula el sostenido, y **rojo con marco
+alrededor del vídeo** (`ENCORVADO`) al confirmarse el riesgo. Solo aparece cuando
+hay algo que avisar, para no ensuciar la imagen el resto del tiempo.
 
 **Alarma no bloqueante** (`emitir_alarma_async`): `winsound.Beep` se lanza en un
 `threading.Thread(daemon=True)` para no congelar el vídeo.
@@ -578,6 +737,7 @@ Agrupa todos los parámetros ajustables. Bloques principales:
 | Cuello (banda de score) | `CUELLO_NEUTRO_MIN/MAX`, `CUELLO_EXTENSION_MARCADA`, `CUELLO_FLEXION_MODERADA` (§6.3) |
 | Encorvamiento lateral | Parámetros Canny, ROI, calibración, ganancia (§7) |
 | Suavizado | `SUAVIZADO_ALPHA` (EMA) y `SUAVIZADO_ONEEURO` + `ONEEURO_2D_*` / `ONEEURO_3D_*` |
+| Detector ML | `ML_ACTIVO`, `ML_UMBRAL_ON` / `ML_UMBRAL_OFF` (histéresis), `ML_ALPHA` (EMA), `ML_DISPARA_ALARMA`, `ML_FRAMES_ALARMA` (sostenido, §8.6), `SESIONES_EXCLUIDAS` (§8.3) |
 | Alarma | Frecuencia, duración, umbrales de frames y de RULA |
 | Colores | Paleta BGR por nivel de riesgo |
 

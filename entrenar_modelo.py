@@ -33,6 +33,11 @@ from sklearn.metrics import classification_report, confusion_matrix
 
 from features_postura import FEATURE_NAMES
 
+try:
+    from config import SESIONES_EXCLUIDAS
+except ImportError:      # config sin la constante (versiones antiguas)
+    SESIONES_EXCLUIDAS = []
+
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(_DIR, 'datos_postura.csv')
 MODELO_PATH = os.path.join(_DIR, 'modelo_postura.joblib')
@@ -45,6 +50,27 @@ def main():
 
     df = pd.read_csv(CSV_PATH)
     print(f"[Datos] {len(df)} filas leídas de {os.path.basename(CSV_PATH)}")
+
+    # Sesiones excluidas a propósito (config.SESIONES_EXCLUIDAS). Las filas siguen
+    # en el CSV; solo se dejan fuera del entrenamiento. Se avisa SIEMPRE, para que
+    # nadie interprete mal las métricas creyendo que se entrenó con todo.
+    if SESIONES_EXCLUIDAS and 'sesion' in df.columns:
+        presentes = [s for s in SESIONES_EXCLUIDAS if (df['sesion'] == s).any()]
+        ausentes = [s for s in SESIONES_EXCLUIDAS if s not in presentes]
+        if presentes:
+            n_antes = len(df)
+            df = df[~df['sesion'].isin(presentes)]
+            print(f"[Datos] EXCLUIDAS {n_antes - len(df)} filas de "
+                  f"{len(presentes)} sesión(es) por config.SESIONES_EXCLUIDAS: "
+                  f"{', '.join(presentes)}")
+            print("        (las filas siguen en el CSV; quita el id de la lista "
+                  "para volver a incluirlas)")
+        if ausentes:
+            print(f"[AVISO] Estas sesiones de SESIONES_EXCLUIDAS no existen en el "
+                  f"CSV: {', '.join(ausentes)}")
+        if df.empty:
+            print("[ERROR] No quedan filas tras excluir sesiones.")
+            sys.exit(1)
 
     # Validar columnas
     faltan = [c for c in FEATURE_NAMES + ['label'] if c not in df.columns]

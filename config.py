@@ -242,6 +242,52 @@ ENCORVADO_CALIB_ALPHA_SUBIDA = 0.05    # Adopción de postura más erguida (baja
 ENCORVADO_CALIB_ALPHA_BAJADA = 0.0005  # Deriva lentísima al encorvarse (no erosiona la línea base)
 
 # =============================================================================
+# DETECTOR ML DE ENCORVAMIENTO (Random Forest entrenado con tus datos)
+# =============================================================================
+# Complementa a RULA: RULA mide ángulos contra tablas ergonómicas fijas, mientras
+# que este modelo aprendió TU forma concreta de encorvarte a partir de las
+# sesiones grabadas con recolectar_datos.py y entrenadas con entrenar_modelo.py.
+# Si no existe modelo_postura.joblib, todo esto se ignora y el sistema funciona
+# solo con RULA (no rompe nada).
+# --- Sesiones excluidas del entrenamiento -----------------------------------
+# Identificadores de sesión (columna `sesion` del CSV) que `entrenar_modelo.py`
+# IGNORA. Las filas NO se borran del CSV: solo se dejan fuera del entrenamiento,
+# así que basta con quitar el id de esta lista para volver a incluirlas.
+# Útil cuando una grabación concreta empeora el modelo y se quiere volver atrás
+# sin perder los datos.
+#
+# 20260723_232603: sesión buena (d=1.10, mayoritaria erguido), pero el modelo
+#   de 7 sesiones que la incluía resultó globalmente peor que el de 6 (77% vs
+#   79%, más alarmas falsas, peor recall encorvado). Se decidió volver al de 6
+#   sesiones. Sus datos son de calidad: reincorporarla es el primer candidato
+#   cuando se sumen más grabaciones erguidas y se rehaga el barrido (§8.6).
+# (La sesión 20260723_224143, que degradaba el modelo, se BORRÓ del CSV el
+#  2026-07-23; por eso ya no aparece aquí. Respaldo: datos_postura.csv.bak_20260723.)
+SESIONES_EXCLUIDAS = ['20260723_232603']
+
+ML_ACTIVO = True                 # False = ignorar el modelo aunque exista el .joblib
+ML_UMBRAL_ON = 0.60              # Prob. suavizada a partir de la cual se marca ENCORVADO
+ML_UMBRAL_OFF = 0.40             # Prob. por debajo de la cual se apaga (histéresis, evita parpadeo)
+ML_ALPHA = 0.30                  # Suavizado temporal (EMA) de la probabilidad (mayor = más reactivo)
+# IMPORTANTE: el umbral óptimo DEPENDE DEL MODELO, no es una constante universal.
+# Historial de barridos: 0.60/0.40 (modelo de 6 ses, el actual), 0.80/0.60 (7 ses
+# con la sesión mala 224143), 0.70/0.50 (7 ses con la sesión buena 232603). Se
+# volvió al modelo de 6 sesiones por ser globalmente el mejor, y con él 0.60/0.40
+# es el óptimo (2 alarmas falsas / 18 correctas). Al reentrenar, rehacer SIEMPRE el
+# barrido de informe.md §8.6.
+
+# El modelo acierta ~79% validado por sesión, con recall alto pero bastantes
+# falsos positivos por frame. Por eso NO dispara al instante: hay que sostener
+# la postura bastante más que el umbral de RULA para que cuente como riesgo real
+# y suene la alarma.
+ML_DISPARA_ALARMA = True         # False = el ML solo informa en pantalla, nunca suena
+ML_FRAMES_ALARMA = 90            # Frames seguidos encorvado para contar como RIESGO (~3 s a 30 FPS).
+                                 # OJO: eso es "entrar en riesgo", no "sonar". Después aún
+                                 # aplica UMBRAL_FRAMES_ALARMA como a cualquier riesgo, así
+                                 # que la alarma por ML suena a los ~90+45 frames (~4,5 s).
+                                 # Súbelo si te suena de más; bájalo si te avisa tarde.
+
+# =============================================================================
 # PARÁMETROS DE ALARMA
 # =============================================================================
 ALARMA_FRECUENCIA_HZ = 1000     # Frecuencia del tono (Hz)
